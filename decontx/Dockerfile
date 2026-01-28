@@ -41,3 +41,4 @@ RUN apt-get update && \
 
 # Now install celda
 RUN Rscript -e "BiocManager::install('celda', force=TRUE, ask=FALSE)"
+RUN Rscript -e "library(celda); print('celda loaded successfully');"
