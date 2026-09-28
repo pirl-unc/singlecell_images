@@ -1,0 +1,82 @@
+# Builds one image directory's Dockerfile on a native amd64 runner and pushes it to
+# Docker Hub as benjaminvincentlab/<image-dir>:<version>. See ../../README.md
+# "Release process" for the tag-driven release flow and required secrets.
+#
+# Native amd64 on purpose: building these images on an arm64 Mac under QEMU emulation
+# has produced non-deterministic compiler crashes (segfaulting g++, an internal
+# compiler error, a broken pipe in an apt post-install script) - a different package
+# failing each attempt. ubuntu-latest runners are native x86_64, so that whole class
+# of failure cannot occur here.
+name: Build and push image
+
+on:
+  push:
+    tags:
+      - '*/*'
+  workflow_dispatch:
+    inputs:
+      image_dir:
+        description: "Image directory to build (e.g. agentic_downstream)"
+        required: true
+      version:
+        description: "Version tag to publish as (e.g. 0.0.1)"
+        required: true
+      push:
+        description: "Push to Docker Hub"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag pushes always publish (that's the point of tagging a release). Manual
+      # runs default to build+smoke-test only, matching the README's "untick push to
+      # test without publishing" guidance.
+      - name: Resolve image directory, version, and push flag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "image_dir=${{ github.event.inputs.image_dir }}" >> "$GITHUB_OUTPUT"
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "push=${{ github.event.inputs.push }}" >> "$GITHUB_OUTPUT"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+            echo "image_dir=${tag%%/*}" >> "$GITHUB_OUTPUT"
+            echo "version=${tag#*/}" >> "$GITHUB_OUTPUT"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify image directory and Dockerfile exist
+        run: test -f "${{ steps.vars.outputs.image_dir }}/Dockerfile"
+
+      - name: Build image
+        run: |
+          docker build --platform linux/amd64 \
+            -t "benjaminvincentlab/${{ steps.vars.outputs.image_dir }}:${{ steps.vars.outputs.version }}" \
+            "${{ steps.vars.outputs.image_dir }}"
+
+      # Deliberately generic across every image directory (some are R-only, some also
+      # bundle Node/CLI tooling) - this only confirms the container starts and a shell
+      # runs, not that any particular package inside works. Each directory's own gate
+      # layers (see its Dockerfile/.def) are what actually validate package content at
+      # build time.
+      - name: Smoke test
+        run: |
+          docker run --rm --entrypoint bash \
+            "benjaminvincentlab/${{ steps.vars.outputs.image_dir }}:${{ steps.vars.outputs.version }}" \
+            -c 'true'
+
+      - name: Log in to Docker Hub
+        if: steps.vars.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image
+        if: steps.vars.outputs.push == 'true'
+        run: |
+          docker push "benjaminvincentlab/${{ steps.vars.outputs.image_dir }}:${{ steps.vars.outputs.version }}"
