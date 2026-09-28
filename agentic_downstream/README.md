@@ -258,14 +258,22 @@ present first, and `clustermole` needs Bioconductor packages that
 `install.packages()` won't fetch because `getOption("repos")` is CRAN-only. Pass
 `repos = BiocManager::repositories()` for the `install_local()` calls.
 
-**codex prints a harmless "could not create PATH aliases" warning.** Every time
-`codex` runs - during the build's version-check gate, and (expected) again during
-normal use of the final image - it tries to write some PATH-alias bookkeeping and,
-finding the filesystem read-only at that point, prints
-`WARNING: proceeding, even though we could not create PATH aliases: Read-only file
-system (os error 30)` and continues normally. Non-fatal (the CLI still runs; the
-build still succeeds). A built `.sif` is a read-only squashfs at runtime, so expect
-to see this on every `codex` invocation there too - it's not specific to the build.
+**codex prints harmless warnings about its own housekeeping on a read-only
+filesystem.** Every time `codex` runs - during the build's version-check gate, and
+(expected) again during normal use of the final image - it tries some bookkeeping
+step (creating PATH aliases, garbage-collecting stale temp dirs from previous
+invocations) that fails against a read-only filesystem and prints a warning before
+continuing normally. Observed so far:
+- `WARNING: proceeding, even though we could not create PATH aliases: Read-only file
+  system (os error 30)`
+- `WARNING: failed to clean up stale arg0 temp dirs: Directory not empty (os error 39)`
+  (`ENOTEMPTY` - it can't delete the stale directory's contents on a read-only
+  filesystem, so the directory it's left with isn't empty either)
+
+Both non-fatal (the CLI still runs immediately afterward; the build still succeeds).
+A built `.sif` is a read-only squashfs at runtime, so expect to keep seeing these (or
+similar) on every `codex` invocation there - not specific to the build, and not
+something to chase down further unless codex actually stops working.
 
 **A host personal R library can shadow the container's packages at run time.**
 Apptainer binds the invoking user's real `$HOME` into the container by default (this
