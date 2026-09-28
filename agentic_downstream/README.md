@@ -258,6 +258,15 @@ present first, and `clustermole` needs Bioconductor packages that
 `install.packages()` won't fetch because `getOption("repos")` is CRAN-only. Pass
 `repos = BiocManager::repositories()` for the `install_local()` calls.
 
+**codex prints a harmless "could not create PATH aliases" warning.** Every time
+`codex` runs - during the build's version-check gate, and (expected) again during
+normal use of the final image - it tries to write some PATH-alias bookkeeping and,
+finding the filesystem read-only at that point, prints
+`WARNING: proceeding, even though we could not create PATH aliases: Read-only file
+system (os error 30)` and continues normally. Non-fatal (the CLI still runs; the
+build still succeeds). A built `.sif` is a read-only squashfs at runtime, so expect
+to see this on every `codex` invocation there too - it's not specific to the build.
+
 **Two pins predate R 4.4** and should be re-checked if the base image moves again:
 ComplexHeatmap at commit `ae0ec42` (2.15.4-era, untagged), and SCPA's archived
 `crossmatch` 1.3.1 / `multicross` 2.1.0.
