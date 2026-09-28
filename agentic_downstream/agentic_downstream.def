@@ -16,6 +16,22 @@ From: bioconductor/bioconductor_docker:RELEASE_3_20
     org.opencontainers.image.base.name bioconductor/bioconductor_docker:RELEASE_3_20
     org.opencontainers.image.vendor Benjamin Vincent Lab, UNC Lineberger
 
+# Redirect R's personal user-library path to somewhere specific to this image, rather
+# than the host's generic ~/R/<arch>-library/<Rversion> default. We deliberately bind
+# the invoking user's real $HOME at run time (see entrypoint.sh / README.md - the
+# agent CLIs need it for persisted OAuth credentials), and Apptainer does this by
+# default anyway. Left at its default, R's per-user library sits ahead of the
+# container's own site-library in .libPaths(), so any package that also happens to
+# exist in the user's own (host, non-container) R library shadows this image's copy -
+# and if that host copy was compiled against a different R/BLAS/LAPACK build, loading
+# it fails with an unhelpful dyn.load() error that looks like a build problem but
+# isn't. See README.md "Gotchas". Follows the Rocker Project's own recommended fix
+# (rocker-project.org/use/singularity.html) - redirect, don't just disable, so a
+# genuinely-needed personal install still has somewhere sane and non-conflicting to
+# land.
+%environment
+    export R_LIBS_USER="${HOME}/R/agentic_downstream/4.4"
+
 %post
     set -eu
     export DEBIAN_FRONTEND=noninteractive

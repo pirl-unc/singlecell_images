@@ -267,6 +267,39 @@ system (os error 30)` and continues normally. Non-fatal (the CLI still runs; the
 build still succeeds). A built `.sif` is a read-only squashfs at runtime, so expect
 to see this on every `codex` invocation there too - it's not specific to the build.
 
+**A host personal R library can shadow the container's packages at run time.**
+Apptainer binds the invoking user's real `$HOME` into the container by default (this
+image relies on that for persisted agent-CLI OAuth credentials - see "Interactive
+use" above), and R's default per-user library path
+(`~/R/<arch>-library/<Rversion>`) lives under `$HOME` too, ahead of the container's
+own site-library in `.libPaths()`. If that directory already exists on the real
+host - from unrelated prior R/RStudio work - its packages get picked up *inside* the
+container instead of (or in addition to) the ones this image installs. Symptoms:
+`apptainer test`/`exec`/`run` reports packages this image deliberately excludes
+(e.g. `SeuratObject`) as "installed but not loadable," and packages this image *does*
+install can fail with a `dyn.load()` error pointing at a path under `/home/<user>/R/...`
+rather than anywhere in the container - e.g.
+`unable to load shared object '.../R/x86_64-pc-linux-gnu-library/4.4/DESeq2/libs/DESeq2.so':
+libRlapack.so: cannot open shared object file`. That `.so` was compiled against a
+different R/BLAS/LAPACK build on the host, not against this image. This cannot
+surface during `apptainer build` (the build-time `$HOME` isn't the real user's home),
+so a clean build gate followed by a run-time failure on the same package is the
+signature of this issue, not a sign the build was wrong.
+
+Fixed by pointing `R_LIBS_USER` at a path specific to this image rather than the
+generic host default - see `%environment` in `agentic_downstream.def` (the setting
+that actually matters, since Apptainer is the deliverable) and the `ENV R_LIBS_USER`
+note in the Dockerfile. Follows the
+[Rocker Project's own Singularity guidance](https://rocker-project.org/use/singularity.html):
+redirect, don't just disable, so a genuinely-needed personal install still has
+somewhere sane to land. To work around this on an already-built image without a
+rebuild, pass `--env R_LIBS_USER=/some/empty/path` to `apptainer test`/`exec`/`run`.
+
+This is a general Apptainer + `$HOME`-binding risk, not specific to this image's
+package list - `../singlecell_downstream` binds `/home/$USER` the same way (see its
+`%help`) and could hit the same shadowing if a conflicting package name exists in a
+user's personal library.
+
 **Two pins predate R 4.4** and should be re-checked if the base image moves again:
 ComplexHeatmap at commit `ae0ec42` (2.15.4-era, untagged), and SCPA's archived
 `crossmatch` 1.3.1 / `multicross` 2.1.0.
