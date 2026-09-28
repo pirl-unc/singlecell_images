@@ -74,20 +74,33 @@ and when you are completely finished, create an empty marker file named '${RESPO
 
 cd "$PROMPT_DIR"
 
+# Permission bypass for all three agents - required because a batch job has no
+# human available to click through an approval prompt, and each CLI defaults to
+# an interactive-approval posture even in its headless/print mode: without this,
+# every CLI reads PROMPT_FILE fine but then refuses to write RESPONSE_FILE. Safe
+# here specifically because this is an isolated, single-purpose container - each
+# vendor's own docs recommend the equivalent full-bypass flag for exactly that
+# case (e.g. Claude Code's docs list `claude -p "<prompt>" --dangerously-skip-permissions`
+# under "Run fully unattended inside a container"). See README.md "Gotchas".
 case "$AGENT" in
   claude)
     # CLAUDE_CODE_EFFORT_LEVEL takes precedence over other effort settings
     # for headless (--print) runs. --model is only passed when overridden.
+    # --dangerously-skip-permissions: --print starts in Manual (read-only) mode
+    # by default, which reads PROMPT_FILE fine but blocks writing RESPONSE_FILE.
     export CLAUDE_CODE_EFFORT_LEVEL="$AGENT_EFFORT"
-    claude_args=(--print)
+    claude_args=(--print --dangerously-skip-permissions)
     [[ -n "$AGENT_MODEL" ]] && claude_args+=(--model "$AGENT_MODEL")
     exec claude "${claude_args[@]}" "$WRAPPER"
     ;;
   codex)
     # --skip-git-repo-check: PROMPT_DIR is an arbitrary bound directory, not
     # necessarily a git repo. --sandbox workspace-write: the response/marker
-    # files above must be writable.
-    codex_args=(exec --skip-git-repo-check --sandbox workspace-write -c "model_reasoning_effort=\"${AGENT_EFFORT}\"")
+    # files above must be writable. --ask-for-approval never: workspace-write
+    # alone controls what's technically permitted, not whether codex still
+    # pauses for human approval before using that permission - never is what
+    # actually makes the write happen unattended.
+    codex_args=(exec --skip-git-repo-check --sandbox workspace-write --ask-for-approval never -c "model_reasoning_effort=\"${AGENT_EFFORT}\"")
     [[ -n "$AGENT_MODEL" ]] && codex_args+=(-m "$AGENT_MODEL")
     exec codex "${codex_args[@]}" "$WRAPPER"
     ;;
@@ -95,8 +108,12 @@ case "$AGENT" in
     # gemini-cli does not currently expose a stable CLI flag for thinking
     # budget/reasoning effort (tracked upstream; see README.md) - AGENT_EFFORT
     # is accepted for interface consistency with the other two agents but has
-    # no effect here yet.
-    gemini_args=(-p "$WRAPPER")
+    # no effect here yet. --yolo: bypasses all confirmation prompts (file
+    # writes and shell commands both), matching the other two agents' full
+    # unattended-in-a-container posture. --approval-mode auto_edit is a
+    # narrower alternative if a task only ever needs file reads/writes and
+    # never a shell command - see README.md.
+    gemini_args=(-p "$WRAPPER" --yolo)
     [[ -n "$AGENT_MODEL" ]] && gemini_args+=(-m "$AGENT_MODEL")
     exec gemini "${gemini_args[@]}"
     ;;

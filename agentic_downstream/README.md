@@ -317,6 +317,22 @@ package list - `../singlecell_downstream` binds `/home/$USER` the same way (see 
 `%help`) and could hit the same shadowing if a conflicting package name exists in a
 user's personal library.
 
+**Each agent CLI needs an explicit permission-bypass flag for batch use, even in
+"headless" mode.** All three default to an interactive-approval posture that survives
+into their non-interactive modes: `claude --print` starts in Manual (read-only) mode,
+so it reads `PROMPT_FILE` fine but refuses to write `RESPONSE_FILE`; `codex exec
+--sandbox workspace-write` alone controls what's *technically* permitted, not whether
+codex still pauses for approval before using that permission; `gemini -p` has the same
+gap. Symptom: the agent reports something like "the permission to write wasn't
+granted" and correctly refuses rather than silently failing. `entrypoint.sh` now
+passes `claude --dangerously-skip-permissions`, `codex --ask-for-approval never`, and
+`gemini --yolo`. This is safe specifically *because* this image's whole purpose is
+running a single agent unattended inside an isolated container - Claude Code's own
+docs list `claude -p "<prompt>" --dangerously-skip-permissions` under "Run fully
+unattended inside a container" for exactly this reason. `gemini --approval-mode
+auto_edit` is a narrower alternative to `--yolo` if a task only ever needs file
+reads/writes and never a shell command.
+
 **Two pins predate R 4.4** and should be re-checked if the base image moves again:
 ComplexHeatmap at commit `ae0ec42` (2.15.4-era, untagged), and SCPA's archived
 `crossmatch` 1.3.1 / `multicross` 2.1.0.
