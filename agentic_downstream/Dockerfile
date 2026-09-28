@@ -59,6 +59,33 @@ RUN npm install -g \
         @google/gemini-cli && \
     npm cache clean --force
 
+# Managed settings: denies rm/rmdir/unlink/shred for Claude Code regardless of
+# permission mode, including --dangerously-skip-permissions - managed settings sit
+# above every other settings source (project/.claude/settings.json, user
+# ~/.claude/settings.json, CLI flags) and nothing at runtime can override a managed
+# deny rule. Baked into the read-only image at /etc/claude-code/managed-settings.json,
+# so it also can't be edited away at runtime even though the path itself would
+# normally just need root to write, not a read-only filesystem.
+# CAVEAT (see README.md "Security"): this is a match on the command TEXT Claude
+# usually writes, not an OS-level boundary - it stops the normal rm invocation, not
+# every conceivable way a subprocess could delete a file. The actual boundary against
+# deleting anything outside the intended directory is what's bound writable at the
+# Apptainer level (see README.md "Batch use" - don't bind $HOME for batch jobs).
+RUN mkdir -p /etc/claude-code && \
+    printf '%s\n' \
+      '{' \
+      '  "permissions": {' \
+      '    "deny": [' \
+      '      "Bash(rm *)",' \
+      '      "Bash(rmdir *)",' \
+      '      "Bash(unlink *)",' \
+      '      "Bash(shred *)"' \
+      '    ]' \
+      '  }' \
+      '}' \
+      > /etc/claude-code/managed-settings.json && \
+    chmod 644 /etc/claude-code/managed-settings.json
+
 # bioconductor/bioconductor_docker:RELEASE_3_20 already configures a Posit-backed
 # binary CRAN repo pointed at __linux__/noble (verified by inspection - see README.md
 # "Gotchas" for why this must never be assumed). Unlike ../singlecell_downstream's

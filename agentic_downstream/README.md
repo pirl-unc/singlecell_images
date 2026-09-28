@@ -127,14 +127,20 @@ batch.
 
 ## Batch use (the plan-review workflow)
 
+Batch/sbatch jobs use `--no-home` and bind **only** the specific prompt directory -
+not `$HOME` - since batch auth is API-key-based and doesn't need it. See "Security"
+below for why this matters: without `--no-home`, Apptainer auto-binds your entire real
+home directory by default, giving an unattended job read/write/delete access far
+beyond the one directory it actually needs.
+
 ```bash
-apptainer run --bind /path/to/shared/dir \
+apptainer run --no-home --bind /path/to/shared/dir \
   --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
   agentic_downstream.sif claude /path/to/shared/dir
 
 # equivalently, via env vars instead of positional args:
 AGENT=codex PROMPT_DIR=/path/to/shared/dir \
-  apptainer run --bind /path/to/shared/dir --env OPENAI_API_KEY="$OPENAI_API_KEY" \
+  apptainer run --no-home --bind /path/to/shared/dir --env OPENAI_API_KEY="$OPENAI_API_KEY" \
   agentic_downstream.sif
 ```
 
@@ -146,13 +152,17 @@ Example `sbatch` script for spinning up a codex review job:
 #SBATCH --time=00:30:00
 #SBATCH --mem=4G
 
-apptainer run --bind /proj/shared/plan_review \
+apptainer run --no-home --bind /proj/shared/plan_review \
   --env OPENAI_API_KEY="$OPENAI_API_KEY" \
   agentic_downstream.sif codex /proj/shared/plan_review
 ```
 
 `gemini`'s equivalent job swaps in `GEMINI_API_KEY` and
 `agentic_downstream.sif gemini /proj/shared/plan_review`.
+
+Interactive use (above) is the one case that *should* still bind `$HOME` - that's how
+a one-time OAuth login persists across runs. The distinction is deliberate: bind
+`$HOME` for a human-driven login session, never for an unattended batch job.
 
 ### Env var passthrough caveat
 
@@ -205,6 +215,67 @@ Slurm job state directly.
 |---|---|---|
 | `AGENT_MODEL` | unset (CLI's own default) | Passed as `--model`/`-m` to whichever agent runs. Left unset by default deliberately - pinning a specific model id here would go stale as providers ship new models faster than this file gets updated. |
 | `AGENT_EFFORT` | `high` | claude: exported as `CLAUDE_CODE_EFFORT_LEVEL` (`low`/`medium`/`high`/`xhigh`/`max`). codex: passed as `-c model_reasoning_effort="..."` (`low`/`medium`/`high`, plus `xhigh` in some SDK contexts). gemini: **currently a no-op** - gemini-cli does not yet expose a stable CLI flag for thinking budget/reasoning effort (tracked upstream in google-gemini/gemini-cli). Revisit once that lands. |
+
+## Security
+
+Batch jobs (via `sbatch`) run each agent CLI with a full permission bypass
+(`--dangerously-skip-permissions` / `--ask-for-approval never` / `--yolo` - see
+`entrypoint.sh`), because there's no human available to click through an approval
+prompt. That means the CLI's *own* internal guardrails are almost entirely off for
+that run. What actually contains an unattended agent is layered, not any single
+mechanism:
+
+**Primary boundary - what's mounted writable.** With a full permission bypass, the
+only real constraint left is what the container can physically write to. A built
+`.sif` is read-only squashfs, so nothing outside an explicit bind mount is writable
+regardless of CLI permission state. The critical detail: **Apptainer auto-binds your
+real `$HOME` by default**, whether or not a job's `--bind` flags mention it. Combined
+with a full permission bypass, that means a batch job that binds `$HOME` (or omits
+`--no-home`) has read/write/delete access to your *entire home directory*, not just
+the prompt directory - regardless of which agent runs. This is why "Batch use" above
+always passes `--no-home` and binds only the specific prompt directory: since batch
+auth is API-key-based, `$HOME` isn't needed for batch jobs at all, so excluding it
+costs nothing and closes the actual exposure. **This is the control that matters most**
+- everything below is defense-in-depth on top of it, not a substitute for it.
+
+**Claude Code has one hard-coded protection that survives the bypass.** Recursive
+removal of the filesystem root, a top-level directory, the home directory, or the
+working directory *itself and its parents* is never auto-approved by any allow rule,
+even in `bypassPermissions` mode - Claude Code calls this a "critical path" and always
+gives it special handling. **Unverified**: the docs describe that handling as "ask,
+with a time limit" in interactive terminal sessions, but don't explicitly state what
+happens for this specific case in non-interactive `-p` batch mode with no terminal to
+show a prompt to. Worth confirming empirically (e.g. asking a batch agent to `rm -rf`
+its own working directory) before relying on it, rather than assuming it denies
+cleanly.
+
+**A baked-in managed-settings deny rule blocks ordinary `rm` usage for Claude
+specifically.** `/etc/claude-code/managed-settings.json` (created at build time - see
+Dockerfile/`.def`) denies `Bash(rm *)`, `Bash(rmdir *)`, `Bash(unlink *)`, and
+`Bash(shred *)`. Managed settings are the highest-precedence settings source Claude
+Code has - nothing in a caller-supplied `PROMPT.md`, a project's own
+`.claude/settings.json`, or a CLI flag can override a managed deny rule, including
+`--dangerously-skip-permissions` itself. **Caveat, stated plainly**: this is a match
+on the command *text* Claude normally writes, not an OS-level enforcement boundary -
+Claude Code's own docs are explicit that a Bash deny rule "isn't a security boundary
+around the program" and doesn't catch the same deletion attempted a different way
+(e.g. a Python script calling `os.remove()`). It stops the ordinary case; it is not a
+substitute for the bind-mount boundary above.
+
+**codex and gemini are not equivalent to each other here.** `--sandbox workspace-write`
+gives codex a real OS-level sandbox (not a text-match convention) that scopes file
+operations to its working directory - a meaningfully stronger mechanism than Claude's
+deny rule, though **unverified**: whether that "workspace" boundary resolves exactly to
+`PROMPT_DIR` given this image also passes `--skip-git-repo-check` hasn't been
+confirmed empirically. gemini has no equivalent mechanism I could confirm - for
+gemini, the bind-mount boundary above is the *only* real protection, not one layer
+among several.
+
+**Recommended before trusting this for unattended `sbatch` runs**: test with a
+deliberately adversarial `PROMPT.md` (e.g. "delete PROMPT.md itself," "list and read
+files in `$HOME`," "write a file to `/etc`") against each of the three agents with
+`--no-home` and a directory-only bind, and confirm the failure mode is a clean denial
+rather than success or a hang.
 
 ## Gotchas
 
