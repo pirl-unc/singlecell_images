@@ -295,6 +295,15 @@ redirect, don't just disable, so a genuinely-needed personal install still has
 somewhere sane to land. To work around this on an already-built image without a
 rebuild, pass `--env R_LIBS_USER=/some/empty/path` to `apptainer test`/`exec`/`run`.
 
+Note that fixing this still requires a full `.sif` rebuild either way, regardless of
+where in `agentic_downstream.def` the fix lives: `%post` is one shell block with no
+layer caching (see "Iterating on a failed build" above), so `apptainer build`
+re-executes the entire apt/Node/R install chain from scratch every time, no matter
+what changed or where. The Dockerfile *does* have Docker's layer caching, which is
+why its `ENV R_LIBS_USER` line is placed at the very end, after everything expensive -
+that ordering is meaningless for the `.def`/Apptainer, but keeps an incremental Docker
+build cheap if this file is ever rebuilt that way.
+
 This is a general Apptainer + `$HOME`-binding risk, not specific to this image's
 package list - `../singlecell_downstream` binds `/home/$USER` the same way (see its
 `%help`) and could hit the same shadowing if a conflicting package name exists in a

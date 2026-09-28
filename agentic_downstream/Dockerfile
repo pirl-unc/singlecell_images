@@ -12,15 +12,6 @@ LABEL org.opencontainers.image.source="https://github.com/pirl-unc/singlecell_im
 LABEL org.opencontainers.image.base.name="bioconductor/bioconductor_docker:RELEASE_3_20"
 LABEL org.opencontainers.image.vendor="Benjamin Vincent Lab, UNC Lineberger"
 
-# Redirect R's personal user-library path to a fixed container-local path rather than
-# the default ~/R/<arch>-library/<Rversion>. Plain `docker run` doesn't auto-bind the
-# host's real $HOME the way Apptainer does, so this matters less here than in the
-# .def - but the .def's %environment equivalent (see agentic_downstream.def) is the
-# one that actually matters, since this image is designed to run under Apptainer with
-# $HOME bound (see README.md "Gotchas" for why that bind happens and what breaks
-# without this fix).
-ENV R_LIBS_USER=/opt/r-libs-user
-
 # libmagick++-6.q16-9t64 is the ImageMagick runtime, required because SpatialExperiment
 # imports magick - not because anything here uses ImageMagick. Runtime package, not
 # -dev (mirrors the fix in ../singlecell_downstream, which hit this same chain via
@@ -157,6 +148,18 @@ RUN Rscript -e "pkgs <- rownames(installed.packages()); \
 RUN Rscript -e "message('R ', getRversion(), ' | Bioc ', BiocManager::version())" && \
     node --version && npm --version && \
     claude --version && codex --version && gemini --version
+
+# Redirect R's personal user-library path to a fixed container-local path rather than
+# the default ~/R/<arch>-library/<Rversion>. Plain `docker run` doesn't auto-bind the
+# host's real $HOME the way Apptainer does, so this matters less here than in the
+# .def - but the .def's %environment equivalent (see agentic_downstream.def) is the
+# one that actually matters, since this image is designed to run under Apptainer with
+# $HOME bound (see README.md "Gotchas" for why that bind happens and what breaks
+# without this fix). Placed at the end, not near the top with the other LABEL/ENV
+# lines: nothing above this needs it at build time, so keeping it last means an
+# incremental Docker build only invalidates this one cheap layer, not the entire
+# apt/Node/R install chain above it.
+ENV R_LIBS_USER=/opt/r-libs-user
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
