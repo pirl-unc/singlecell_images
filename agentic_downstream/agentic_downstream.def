@@ -12,7 +12,7 @@ From: bioconductor/bioconductor_docker:RELEASE_3_20
 %labels
     org.opencontainers.image.title agentic_downstream
     org.opencontainers.image.description Seurat-free downstream single-cell analysis (SingleCellExperiment, UCell, DESeq2 pseudobulk DE, fgsea, SCPA, speckle/limma, harmony, ComplexHeatmap, survival modelling) plus claude/codex/gemini CLI agents for cluster-based agentic review workflows.
-    org.opencontainers.image.source https://github.com/pirl-unc/singlecell_decontamination
+    org.opencontainers.image.source https://github.com/pirl-unc/singlecell_images
     org.opencontainers.image.base.name bioconductor/bioconductor_docker:RELEASE_3_20
     org.opencontainers.image.vendor Benjamin Vincent Lab, UNC Lineberger
 
@@ -174,7 +174,7 @@ From: bioconductor/bioconductor_docker:RELEASE_3_20
     Seurat-free downstream single-cell analysis: SingleCellExperiment, UCell, DESeq2,
     fgsea, SCPA, speckle/limma, scran/scater, harmony, ComplexHeatmap, survival
     modelling - plus claude/codex/gemini CLI agents for cluster-based agentic review
-    workflows. See README.md in the image repo (github.com/pirl-unc/singlecell_decontamination).
+    workflows. See README.md in the image repo (github.com/pirl-unc/singlecell_images).
 
         # R work, same pattern as ../singlecell_downstream
         apptainer exec --bind /datastore,/home/$USER <image>.sif Rscript my_script.R

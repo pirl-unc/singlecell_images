@@ -8,7 +8,7 @@ FROM --platform=linux/amd64 bioconductor/bioconductor_docker:RELEASE_3_20
 
 LABEL org.opencontainers.image.title="agentic_downstream"
 LABEL org.opencontainers.image.description="Seurat-free downstream single-cell analysis (SingleCellExperiment, UCell, DESeq2 pseudobulk DE, fgsea, SCPA, speckle/limma, harmony, ComplexHeatmap, survival modelling) plus claude/codex/gemini CLI agents for cluster-based agentic review workflows."
-LABEL org.opencontainers.image.source="https://github.com/pirl-unc/singlecell_decontamination"
+LABEL org.opencontainers.image.source="https://github.com/pirl-unc/singlecell_images"
 LABEL org.opencontainers.image.base.name="bioconductor/bioconductor_docker:RELEASE_3_20"
 LABEL org.opencontainers.image.vendor="Benjamin Vincent Lab, UNC Lineberger"
 
