@@ -229,7 +229,9 @@ MANAGED_SETTINGS
         # Interactive agent login / ad hoc CLI use (bypasses %runscript)
         apptainer shell --bind /home/$USER <image>.sif
 
-        # Batch agent run (uses %runscript -> entrypoint.sh)
-        apptainer run --bind /path/to/shared/dir \
+        # Batch agent run (uses %runscript -> entrypoint.sh). --no-home: batch auth
+        # is API-key based, so $HOME isn't needed - see README.md "Security" for
+        # why omitting --no-home would expose your whole home directory here.
+        apptainer run --no-home --bind /path/to/shared/dir \
           --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
           <image>.sif claude /path/to/shared/dir
