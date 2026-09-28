@@ -67,10 +67,38 @@ if [[ -n "${OPENAI_API_KEY:-}" && -z "${CODEX_API_KEY:-}" ]]; then
   export CODEX_API_KEY="$OPENAI_API_KEY"
 fi
 
+# CONTEXT_DIRS - colon-separated list of additional directories the agent should
+# read for context (e.g. the actual project being reviewed), distinct from
+# PROMPT_DIR where the prompt/response contract lives. This is documentation for
+# the agent, not an access grant: a directory only becomes readable because it was
+# --bind mounted into the container (see README.md "Can I bind additional
+# directories for read?") - listing it here just tells the agent it exists and is
+# in scope, and (for claude) registers it as a first-class working directory via
+# --add-dir rather than an incidental read target. Entries that don't exist are
+# warned about, not fatal - the caller may have forgotten to --bind one, but the
+# primary prompt/response task can still proceed without it.
+CONTEXT_DIRS="${CONTEXT_DIRS:-}"
+CONTEXT_DIR_LIST=()
+if [[ -n "$CONTEXT_DIRS" ]]; then
+  IFS=':' read -ra CONTEXT_DIR_LIST <<< "$CONTEXT_DIRS"
+fi
+
+CONTEXT_NOTE=""
+for d in "${CONTEXT_DIR_LIST[@]}"; do
+  if [[ -d "$d" ]]; then
+    CONTEXT_NOTE="${CONTEXT_NOTE} ${d}"
+  else
+    echo "Warning: CONTEXT_DIRS entry '$d' is not a directory - was it --bind mounted? Continuing without it." >&2
+  fi
+done
+
 WRAPPER="You are being run as the '${AGENT}' agent in a non-interactive batch job. \
 Your task is described in the file '${PROMPT_FILE}' in the current directory (${PROMPT_DIR}) - read it and follow its instructions. \
 Unless it tells you to write your output somewhere else, write your complete response to a file named '${RESPONSE_FILE}' in this same directory, \
 and when you are completely finished, create an empty marker file named '${RESPONSE_FILE}.done'."
+if [[ -n "$CONTEXT_NOTE" ]]; then
+  WRAPPER="${WRAPPER} Additional context is available, read-only, in the following director(ies): ${CONTEXT_NOTE# }. Do not attempt to modify anything there."
+fi
 
 cd "$PROMPT_DIR"
 
@@ -91,6 +119,9 @@ case "$AGENT" in
     export CLAUDE_CODE_EFFORT_LEVEL="$AGENT_EFFORT"
     claude_args=(--print --dangerously-skip-permissions)
     [[ -n "$AGENT_MODEL" ]] && claude_args+=(--model "$AGENT_MODEL")
+    for d in "${CONTEXT_DIR_LIST[@]}"; do
+      [[ -d "$d" ]] && claude_args+=(--add-dir "$d")
+    done
     exec claude "${claude_args[@]}" "$WRAPPER"
     ;;
   codex)

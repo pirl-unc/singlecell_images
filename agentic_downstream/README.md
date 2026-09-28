@@ -209,6 +209,41 @@ more specific instruction. A manager `claude` session can poll the shared direct
 for `RESPONSE_<agent>.md.done` to know a review has landed, without needing to track
 Slurm job state directly.
 
+### Additional context directories (reviewing a separate project)
+
+A review task often needs to read the actual project being reviewed, not just the
+`PROMPT.md`/`RESPONSE_<agent>.md` pair in the prompt directory. Bind the project
+directory **read-only** alongside the prompt directory, and list it in `CONTEXT_DIRS`
+(colon-separated, PATH-style) so the entrypoint tells the agent it exists and is in
+scope:
+
+```bash
+apptainer run --no-home \
+  --bind /path/to/shared/review_dir \
+  --bind /path/to/project:/path/to/project:ro \
+  --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  --env CONTEXT_DIRS=/path/to/project \
+  agentic_downstream.sif claude /path/to/shared/review_dir
+
+# multiple context directories:
+--env CONTEXT_DIRS=/path/to/project:/path/to/shared/docs
+```
+
+`CONTEXT_DIRS` is documentation for the agent, not an access grant on its own - a
+directory is only actually readable because it was `--bind` mounted (with `:ro` so
+review access can't become write/delete access too; see "Security" above for why the
+mount, not the CLI's cooperation, is the boundary that matters). Listing it in
+`CONTEXT_DIRS` just makes the agent aware of it: for claude, `entrypoint.sh` passes
+each entry as `--add-dir`, registering it as a first-class working directory rather
+than an incidental read target; for codex and gemini, which have no equivalent flag,
+the wrapper instruction mentions the paths directly instead. An entry that isn't
+actually a directory (e.g. the bind was forgotten) gets a warning on stderr and is
+skipped rather than failing the whole run.
+
+Without `CONTEXT_DIRS` set at all, nothing changes from before - the agent only knows
+about `PROMPT_DIR` unless `PROMPT.md` itself names another path (which still only
+works if that path was bound).
+
 ### Model and reasoning-effort defaults
 
 | Env var | Default | Effect |
