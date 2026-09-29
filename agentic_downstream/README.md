@@ -13,10 +13,11 @@ object model here, not Seurat.
 noble (verified by inspection, see "Gotchas" below), with a Posit-backed binary CRAN
 repo already pointed at `__linux__/noble`.
 
-It also bundles the `claude`, `codex`, and `gemini` CLI agents (plus Node.js) so it can
+It also bundles the `claude`, `codex`, and `agy` (Google Antigravity) CLI agents (plus
+Node.js) so it can
 run as an agentic review environment on the cluster via Apptainer + Slurm: an
 interactive `claude` session can act as a "manager" iterating on an R analysis plan,
-and spin up one-shot `codex`/`gemini` batch jobs pointed at a shared bound directory to
+and spin up one-shot `codex`/`agy` batch jobs pointed at a shared bound directory to
 get a technical review, repeating until satisfied.
 
 ## What's different from `singlecell_downstream`
@@ -26,7 +27,7 @@ get a technical review, repeating until satisfied.
 | Base image | `satijalab/seurat:5.4.0` | `bioconductor/bioconductor_docker:RELEASE_3_20` |
 | Seurat / SeuratObject | included | **not included** |
 | Object model | Seurat + SCE | SCE only |
-| Agent CLIs | none | claude, codex, gemini + Node |
+| Agent CLIs | none | claude, codex, agy + Node |
 | Binary CRAN repo | configured manually (base doesn't ship one) | ships preconfigured on `__linux__/noble` |
 
 If you're porting an analysis script from `singlecell_downstream` to this image, check
@@ -35,13 +36,17 @@ itself isn't here to fall back on.
 
 ## Files
 
-- `agentic_downstream.def` - Apptainer definition; **this is what gets built**
-- `Dockerfile` - equivalent Docker recipe, kept as a portable record
-- `entrypoint.sh` - the batch-job launcher; copied into the image by both of the above
-  (`%files` in the `.def`, `COPY` in the Dockerfile) and invoked by the `.def`'s
-  `%runscript`
+- `agentic_downstream_base.def` - Apptainer definition for the **base layer**: system
+  libraries and the full R/Bioconductor stack. Slow (an hour or more), rarely rebuilt.
+- `agentic_downstream.def` - Apptainer definition for the **final image**, built on top
+  of the base `.sif`: Node, the agent CLIs, managed settings, `entrypoint.sh`. Minutes.
+- `Dockerfile.base` / `Dockerfile` - equivalent Docker recipes for the same two layers,
+  kept as a portable record
+- `entrypoint.sh` - the batch-job launcher; copied into the final image (`%files` in the
+  `.def`, `COPY` in the Dockerfile) and invoked by its `%runscript`/`ENTRYPOINT`
 
-The `.def` and `Dockerfile` are identical in package content. **Change both together.**
+Each `.def` and its Dockerfile are identical in package content. **Change both
+together.** See "Two-layer build" below for which layer a given change belongs in.
 
 ## Why a `.def` file
 
@@ -57,24 +62,88 @@ hardware.
 
 ## Build
 
-On a native **x86_64** host with Apptainer:
+On a native **x86_64** host with Apptainer (1.2+, for `--build-arg`), from this
+directory. Base first - only when it doesn't exist yet or the R stack changed:
 
 ```bash
 export APPTAINER_TMPDIR=/datastore/scratch/users/$USER
 apptainer build --fakeroot \
+  /datastore/scratch/users/$USER/agentic_downstream_base_<base_version>.sif \
+  agentic_downstream_base.def
+```
+
+Then the final image, pointed at that base:
+
+```bash
+apptainer build --fakeroot \
+  --build-arg BASE_IMAGE=/path/to/agentic_downstream_base_<base_version>.sif \
   /datastore/scratch/users/$USER/agentic_downstream_<version>.sif \
   agentic_downstream.def
 ```
 
-`--fakeroot` works without an `/etc/subuid` entry - Apptainer falls back to a
+`BASE_IMAGE` defaults to `agentic_downstream_base.sif` in the current directory if not
+passed. `--fakeroot` works without an `/etc/subuid` entry - Apptainer falls back to a
 root-mapped user namespace, sufficient for `apt-get install`/`npm install -g` on a
-glibc base. Build into scratch, then move the `.sif` to its final directory.
+glibc base. Build into scratch, then move each `.sif` to its final directory. **Keep
+the base `.sif`** - deleting it means the next CLI or entrypoint change costs the full
+hour again.
 
 Docker equivalent, if building on amd64 hardware:
 
 ```bash
-docker build --platform linux/amd64 -t benjaminvincentlab/agentic_downstream:<version> .
+docker build --platform linux/amd64 -f Dockerfile.base \
+  -t benjaminvincentlab/agentic_downstream_base:<base_version> .
+docker build --platform linux/amd64 \
+  --build-arg BASE_IMAGE=benjaminvincentlab/agentic_downstream_base:<base_version> \
+  -t benjaminvincentlab/agentic_downstream:<version> .
 ```
+
+### Two-layer build
+
+The R/Bioconductor install is well over an hour and changes rarely; the agent CLIs and
+`entrypoint.sh` change often. Apptainer has no layer caching - `%post` is one shell block
+that re-runs from scratch on every build - so in a single `.def` any edit to
+`entrypoint.sh`, or just picking up a new `claude`/`codex`/`agy` release, cost a
+full R rebuild. Splitting the image keeps those changes to a few minutes.
+
+| Change | Rebuild |
+|---|---|
+| `entrypoint.sh`, agent CLI versions, managed settings, Node | final image only |
+| R/Bioconductor/CRAN/GitHub package set, system libraries, base image tag | base, then final |
+| Testing an `entrypoint.sh` edit | neither - see below |
+
+Version the two independently: a final image records which base it was built from in
+the `--build-arg` you passed, so note that alongside the final image's version.
+
+⚠ A derived Apptainer image's `%environment` **replaces** the base's rather than
+extending it, which is why `R_LIBS_USER` appears in both `.def` files. Keep them
+identical (see "Gotchas", host personal R library). Docker `ENV` *is* inherited, so the
+Dockerfile pair sets it only in `Dockerfile.base`.
+
+### Testing an entrypoint change
+
+No rebuild needed. `%runscript` runs `$ENTRYPOINT_OVERRIDE` if set, falling back to the
+baked-in `/usr/local/bin/entrypoint.sh` otherwise. Bind the edited script in and point
+at it:
+
+```bash
+apptainer run --no-home --bind /path/to/shared/dir \
+  --bind /path/to/entrypoint.sh:/path/to/entrypoint.sh:ro \
+  --env ENTRYPOINT_OVERRIDE=/path/to/entrypoint.sh \
+  agentic_downstream.sif claude /path/to/shared/dir
+```
+
+It is invoked via `bash`, so the bound file needs no execute bit. Once it works, rebuild
+the final image to bake it in - an override is for testing, not for production runs.
+
+For an image built **before** `ENTRYPOINT_OVERRIDE` existed, bind the edited script
+directly over the baked-in path instead; this works on any build:
+
+```bash
+--bind /path/to/entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+```
+
+Docker: `-v "$PWD/entrypoint.sh:/tmp/ep.sh:ro" -e ENTRYPOINT_OVERRIDE=/tmp/ep.sh`.
 
 ### Iterating on a failed build
 
@@ -94,15 +163,18 @@ global prefix) writable.
 
 ## Verify
 
-The build runs two gates automatically (R packages, then agent CLI versions), and
-`%test` is re-runnable:
+Each build runs its own gate automatically - R packages in the base build, agent CLI
+versions in the final build - and `%test` is re-runnable on either:
 
 ```bash
-apptainer test <image>.sif
+apptainer test agentic_downstream_base_<base_version>.sif   # full per-package R check
+apptainer test agentic_downstream_<version>.sif             # base came through + CLIs run
 ```
 
-A pass prints `all N required packages present and loadable`, a per-package `OK`
-list, the R/Bioc version line, and each CLI's `--version` output.
+A base pass prints a per-package `OK` list and the R/Bioc version line (the build
+itself prints `all N required packages present and loadable`). A final-image pass
+prints the R/Bioc version line and each CLI's `--version` output. The final image's R
+stack is the base layer unchanged, so it does not repeat the full package check.
 
 ## Interactive use (login, ad hoc work)
 
@@ -119,16 +191,17 @@ docker run -it --entrypoint bash benjaminvincentlab/agentic_downstream:<version>
 ```
 
 `apptainer shell`/`exec` ignore `%runscript` by design. From that shell, run `claude`,
-`codex`, or `gemini` directly. Apptainer binds the real host `$HOME` and runs the
+`codex`, or `agy` directly. Apptainer binds the real host `$HOME` and runs the
 container process as the invoking user (not root, not a baked-in image user), so
-credentials from an interactive login land in `~/.claude`, `~/.codex`, `~/.gemini` on
+credentials from an interactive login land in `~/.claude`, `~/.codex`, `~/.gemini` (agy's) on
 your actual home directory and persist across future runs - both interactive and
 batch.
 
 ## Batch use (the plan-review workflow)
 
 Batch/sbatch jobs use `--no-home` and bind **only** the specific prompt directory -
-not `$HOME` - since batch auth is API-key-based and doesn't need it. See "Security"
+not `$HOME` - API-key auth doesn't need it, and subscription auth needs only one
+credential directory (see "Subscription login for batch runs"). See "Security"
 below for why this matters: without `--no-home`, Apptainer auto-binds your entire real
 home directory by default, giving an unattended job read/write/delete access far
 beyond the one directory it actually needs.
@@ -157,8 +230,9 @@ apptainer run --no-home --bind /proj/shared/plan_review \
   agentic_downstream.sif codex /proj/shared/plan_review
 ```
 
-`gemini`'s equivalent job swaps in `GEMINI_API_KEY` and
-`agentic_downstream.sif gemini /proj/shared/plan_review`.
+`agy`'s equivalent job runs `agentic_downstream.sif agy /proj/shared/plan_review`,
+authenticated by subscription login (see "Subscription login for batch runs") or by
+`GEMINI_API_KEY` (see "API keys").
 
 Interactive use (above) is the one case that *should* still bind `$HOME` - that's how
 a one-time OAuth login persists across runs. The distinction is deliberate: bind
@@ -187,11 +261,60 @@ Check whether your Slurm job template uses `--cleanenv` before assuming a bare
 |---|---|
 | claude | `ANTHROPIC_API_KEY` |
 | codex | `OPENAI_API_KEY` (mirrored to `CODEX_API_KEY` automatically by `entrypoint.sh` if only `OPENAI_API_KEY` is set) |
-| gemini | `GEMINI_API_KEY` |
+| agy | `GEMINI_API_KEY` - **and** `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`; per Google's docs either alone has no effect |
 
-API keys are only needed for headless/batch runs. Interactive sessions that have
-already done a one-time OAuth login (see above) don't need them, since credentials
-persist in the bound `$HOME`.
+API keys bill the provider's API. Interactive sessions that have already done a
+one-time OAuth login (see above) don't need them, since credentials persist in the
+bound `$HOME` - and batch runs can use that same login instead, see below.
+
+Never pass a key as `--env KEY="$KEY"`: the shell expands it onto the command line,
+where other users on a shared node can read it from `ps` / `/proc/<pid>/cmdline`. Keep
+it in a `chmod 600` file, `export KEY="$(< file)"` in the submitting shell, and let
+Apptainer's default environment passthrough carry it in (or use `--env-file`).
+
+### Subscription login for batch runs
+
+To bill a ChatGPT / Claude / Google AI subscription rather than the API, log in once
+interactively, then bind **only** that agent's credential directory into batch jobs.
+Using codex as the example:
+
+```bash
+# once - --device-auth because the default browser-callback login cannot complete
+# on a headless node; it prints a URL + code to enter on any other machine
+apptainer shell --bind "$HOME" agentic_downstream.sif
+codex login --device-auth
+codex login status
+
+# each batch run
+unset OPENAI_API_KEY CODEX_API_KEY
+apptainer run --no-home \
+  --bind "$HOME/.codex:$HOME/.codex" \
+  --bind /path/to/shared/dir \
+  agentic_downstream.sif codex /path/to/shared/dir
+```
+
+- **Unset the API key variables.** Host env passes through by default and
+  `entrypoint.sh` mirrors `OPENAI_API_KEY` into `CODEX_API_KEY`; a key that is present
+  is expected to take precedence over the stored login and bill the API.
+- **Bind the credential directory writable**, not `:ro` - the CLI refreshes its token
+  in place.
+- **The agent can read that token.** It runs with a full permission bypass, so this is
+  the cost of subscription auth; binding one credential directory rather than `$HOME`
+  keeps it to that one credential.
+- claude is the same with `~/.claude`.
+- **agy** (Antigravity) uses `~/.gemini`: log in by running `agy` interactively once
+  (on a headless node it prints a URL and waits for an authorization code to be pasted
+  back), then bind `"$HOME/.gemini:$HOME/.gemini"`. agy prefers the OS keyring (D-Bus
+  Secret Service), which does not exist inside the container; its binary carries a
+  file-based fallback for that case (`Using file-based token storage because %s
+  detected`), so the login is **expected** to land as a file under `~/.gemini` -
+  unverified until the first login, so confirm a file appears there and that a
+  following `--no-home` batch run authenticates. Unset `GEMINI_API_KEY` for
+  subscription runs, for the same reason as the codex keys above.
+- **agy is not gemini-cli.** `@google/gemini-cli` was removed from this image because
+  Google stopped serving it on the "Gemini Code Assist for individuals" tier (login
+  fails with `This client is no longer supported ... migrate to the Antigravity suite`).
+  Old `~/.gemini` contents from gemini-cli are migrated by agy on first run.
 
 ### I/O convention
 
@@ -234,9 +357,9 @@ directory is only actually readable because it was `--bind` mounted (with `:ro` 
 review access can't become write/delete access too; see "Security" above for why the
 mount, not the CLI's cooperation, is the boundary that matters). Listing it in
 `CONTEXT_DIRS` just makes the agent aware of it: for claude, `entrypoint.sh` passes
-each entry as `--add-dir`, registering it as a first-class working directory rather
-than an incidental read target; for codex and gemini, which have no equivalent flag,
-the wrapper instruction mentions the paths directly instead. An entry that isn't
+each entry as `--add-dir` (agy likewise, one `--add-dir` per entry), registering it as
+a first-class working directory rather than an incidental read target; for codex, which
+has no equivalent flag, the wrapper instruction mentions the paths directly instead. An entry that isn't
 actually a directory (e.g. the bind was forgotten) gets a warning on stderr and is
 skipped rather than failing the whole run.
 
@@ -249,13 +372,13 @@ works if that path was bound).
 | Env var | Default | Effect |
 |---|---|---|
 | `AGENT_MODEL` | unset (CLI's own default) | Passed as `--model`/`-m` to whichever agent runs. Left unset by default deliberately - pinning a specific model id here would go stale as providers ship new models faster than this file gets updated. |
-| `AGENT_EFFORT` | `high` | claude: exported as `CLAUDE_CODE_EFFORT_LEVEL` (`low`/`medium`/`high`/`xhigh`/`max`). codex: passed as `-c model_reasoning_effort="..."` (`low`/`medium`/`high`, plus `xhigh` in some SDK contexts). gemini: **currently a no-op** - gemini-cli does not yet expose a stable CLI flag for thinking budget/reasoning effort (tracked upstream in google-gemini/gemini-cli). Revisit once that lands. |
+| `AGENT_EFFORT` | `high` | claude: exported as `CLAUDE_CODE_EFFORT_LEVEL` (`low`/`medium`/`high`/`xhigh`/`max`). codex: passed as `-c model_reasoning_effort="..."` (`low`/`medium`/`high`, plus `xhigh` in some SDK contexts). agy: passed as `--effort` (`low`/`medium`/`high`/`max` - no `xhigh`, which agy will reject). |
 
 ## Security
 
 Batch jobs (via `sbatch`) run each agent CLI with a full permission bypass
-(`--dangerously-skip-permissions` / `--ask-for-approval never` / `--yolo` - see
-`entrypoint.sh`), because there's no human available to click through an approval
+(claude and agy `--dangerously-skip-permissions`, codex
+`--dangerously-bypass-approvals-and-sandbox` - see `entrypoint.sh`), because there's no human available to click through an approval
 prompt. That means the CLI's *own* internal guardrails are almost entirely off for
 that run. What actually contains an unattended agent is layered, not any single
 mechanism:
@@ -268,10 +391,13 @@ real `$HOME` by default**, whether or not a job's `--bind` flags mention it. Com
 with a full permission bypass, that means a batch job that binds `$HOME` (or omits
 `--no-home`) has read/write/delete access to your *entire home directory*, not just
 the prompt directory - regardless of which agent runs. This is why "Batch use" above
-always passes `--no-home` and binds only the specific prompt directory: since batch
-auth is API-key-based, `$HOME` isn't needed for batch jobs at all, so excluding it
-costs nothing and closes the actual exposure. **This is the control that matters most**
-- everything below is defense-in-depth on top of it, not a substitute for it.
+always passes `--no-home` and binds only the specific prompt directory: with API-key
+auth, `$HOME` isn't needed for batch jobs at all, so excluding it costs nothing and
+closes the actual exposure. With subscription auth (see "Subscription login for batch
+runs"), bind back only the one agent's credential directory, never all of `$HOME` -
+and accept that the agent can read the token in it. Context directories should be
+bound `:ro`. **This is the control that matters most** - everything below is
+defense-in-depth on top of it, not a substitute for it.
 
 **Claude Code has one hard-coded protection that survives the bypass.** Recursive
 removal of the filesystem root, a top-level directory, the home directory, or the
@@ -297,14 +423,23 @@ around the program" and doesn't catch the same deletion attempted a different wa
 (e.g. a Python script calling `os.remove()`). It stops the ordinary case; it is not a
 substitute for the bind-mount boundary above.
 
-**codex and gemini are not equivalent to each other here.** `--sandbox workspace-write`
-gives codex a real OS-level sandbox (not a text-match convention) that scopes file
-operations to its working directory - a meaningfully stronger mechanism than Claude's
-deny rule, though **unverified**: whether that "workspace" boundary resolves exactly to
-`PROMPT_DIR` given this image also passes `--skip-git-repo-check` hasn't been
-confirmed empirically. gemini has no equivalent mechanism I could confirm - for
-gemini, the bind-mount boundary above is the *only* real protection, not one layer
-among several.
+**codex and agy have no inner layer here - the bind mounts are their only
+boundary.** codex's own sandbox (`--sandbox workspace-write`) would be a real OS-level
+mechanism, but it is built on bubblewrap, which cannot create its mount namespace
+inside an Apptainer container: every shell command and every file write fails with
+`bwrap: Can't bind mount /oldroot/ on /newroot/: Unable to mount source on
+destination: Invalid argument` (reproduced on codex-cli 0.158 under default,
+`--userns` and `--fakeroot` Apptainer modes, via `codex sandbox linux -- echo`). The
+agent can then neither read `PROMPT.md` nor write its response. `entrypoint.sh`
+therefore runs codex with `--dangerously-bypass-approvals-and-sandbox`, the codex
+equivalent of the claude and agy bypasses, and relies on the container. agy has a
+`--sandbox` flag ("Run in a sandbox with terminal restrictions enabled"), but its
+mechanism is undocumented and it has not been tried inside Apptainer, so
+`entrypoint.sh` does not pass it; agy has no managed deny rule like Claude's either. For both, the bind-mount boundary
+above is the *only* real protection, not one layer among several - which is why
+`:ro` on context directories matters most for these two. (The warning `Codex could
+not find bubblewrap on PATH` is unrelated and harmless: codex falls back to a bundled
+copy, which then fails for the reason above.)
 
 **Recommended before trusting this for unattended `sbatch` runs**: test with a
 deliberately adversarial `PROMPT.md` (e.g. "delete PROMPT.md itself," "list and read
@@ -409,14 +544,13 @@ redirect, don't just disable, so a genuinely-needed personal install still has
 somewhere sane to land. To work around this on an already-built image without a
 rebuild, pass `--env R_LIBS_USER=/some/empty/path` to `apptainer test`/`exec`/`run`.
 
-Note that fixing this still requires a full `.sif` rebuild either way, regardless of
-where in `agentic_downstream.def` the fix lives: `%post` is one shell block with no
-layer caching (see "Iterating on a failed build" above), so `apptainer build`
-re-executes the entire apt/Node/R install chain from scratch every time, no matter
-what changed or where. The Dockerfile *does* have Docker's layer caching, which is
-why its `ENV R_LIBS_USER` line is placed at the very end, after everything expensive -
-that ordering is meaningless for the `.def`/Apptainer, but keeps an incremental Docker
-build cheap if this file is ever rebuilt that way.
+`%post` is one shell block with no layer caching (see "Iterating on a failed build"
+above), so in a single-file `.def` any change here re-ran the entire apt/Node/R install
+chain. With the two-layer build, changing `R_LIBS_USER` only needs the final image
+rebuilt, since its `%environment` is the one that takes effect - but keep the base's
+copy in step (see "Two-layer build"). In `Dockerfile.base` the `ENV R_LIBS_USER` line
+sits at the very end, after everything expensive, so an incremental Docker build of
+the base only invalidates that one cheap layer.
 
 This is a general Apptainer + `$HOME`-binding risk, not specific to this image's
 package list - `../singlecell_downstream` binds `/home/$USER` the same way (see its
@@ -426,18 +560,34 @@ user's personal library.
 **Each agent CLI needs an explicit permission-bypass flag for batch use, even in
 "headless" mode.** All three default to an interactive-approval posture that survives
 into their non-interactive modes: `claude --print` starts in Manual (read-only) mode,
-so it reads `PROMPT_FILE` fine but refuses to write `RESPONSE_FILE`; `codex exec
---sandbox workspace-write` alone controls what's *technically* permitted, not whether
-codex still pauses for approval before using that permission; `gemini -p` has the same
-gap. Symptom: the agent reports something like "the permission to write wasn't
-granted" and correctly refuses rather than silently failing. `entrypoint.sh` now
-passes `claude --dangerously-skip-permissions`, `codex --ask-for-approval never`, and
-`gemini --yolo`. This is safe specifically *because* this image's whole purpose is
+so it reads `PROMPT_FILE` fine but refuses to write `RESPONSE_FILE`; `codex exec`
+pauses for approval unless told not to (and its sandbox cannot run inside Apptainer
+at all - see "Security"); `agy -p` is the most dangerous of the three, because it
+**soft-denies** any tool needing approval and still exits 0, so an unflagged run
+reports success having written nothing. Symptom: the agent reports
+something like "the permission to write wasn't granted" and correctly refuses rather
+than silently failing. `entrypoint.sh` now passes `claude
+--dangerously-skip-permissions`, `codex exec --dangerously-bypass-approvals-and-sandbox`,
+and `agy --dangerously-skip-permissions`. This is safe specifically *because* this image's whole purpose is
 running a single agent unattended inside an isolated container - Claude Code's own
 docs list `claude -p "<prompt>" --dangerously-skip-permissions` under "Run fully
-unattended inside a container" for exactly this reason. `gemini --approval-mode
-auto_edit` is a narrower alternative to `--yolo` if a task only ever needs file
-reads/writes and never a shell command.
+unattended inside a container" for exactly this reason. agy can instead allow specific tools via `"permissions": {"allow": [...]}` in
+`~/.gemini/antigravity-cli/settings.json`, a narrower alternative if a task needs only
+a known set of commands.
+
+**CLI argument order is not free.** Two launches failed on flag placement alone:
+- `claude --add-dir` is variadic (`--add-dir <directories...>`) and consumes every
+  following non-flag argument. Placed last, it swallowed the prompt, and `--print`
+  failed with `Input must be provided either through stdin or as a prompt argument`.
+  `entrypoint.sh` puts `--add-dir` entries first so `--print` terminates the list.
+- codex's `--ask-for-approval` is a top-level option, not an `exec` option (codex-cli
+  0.158): after `exec` it errors `unexpected argument '--ask-for-approval'`. Moot now
+  that `--dangerously-bypass-approvals-and-sandbox` (an `exec` option) replaces it,
+  but relevant if the sandbox ever becomes usable and the flags are split again.
+- `agy -p` is passed LAST, directly before the prompt, so the prompt parses correctly
+  whether agy treats `-p` as a boolean or as taking the prompt as its value.
+
+Check `<cli> --help` inside the image before assuming a flag is misspelled.
 
 **Two pins predate R 4.4** and should be re-checked if the base image moves again:
 ComplexHeatmap at commit `ae0ec42` (2.15.4-era, untagged), and SCPA's archived
@@ -446,13 +596,16 @@ ComplexHeatmap at commit `ae0ec42` (2.15.4-era, untagged), and SCPA's archived
 ## Known gaps / future work
 
 - **Watch/poll mode**: not implemented. The current design assumes a manager `claude`
-  session explicitly spins up one-shot `codex`/`gemini` jobs per review round. A
+  session explicitly spins up one-shot `codex`/`agy` jobs per review round. A
   long-running directory-watching mode can be added later as a change to
-  `entrypoint.sh` - a small, cheap rebuild, not a redo of the R/Bioc layers.
-- **gemini reasoning effort**: no-op until gemini-cli ships a stable flag (see table
-  above).
+  `entrypoint.sh` - a final-image rebuild only (see "Two-layer build"), testable
+  beforehand via `ENTRYPOINT_OVERRIDE`.
+- **agy self-updates by default.** The image sets `AGY_CLI_DISABLE_AUTO_UPDATE=true`
+  (the binary is read-only there anyway); pick up a new agy by rebuilding the final
+  layer. The installer always fetches the *latest* release, so agy is unpinned like
+  the npm CLIs - `agy --version` in the build log records what was baked in.
 - Exact CLI flags/package names for all three agents were verified against public
   docs at the time this image was built, but these tools move fast - if a build or
   run fails on an unrecognized flag, check `claude --help` / `codex exec --help` /
-  `gemini --help` inside the built image before assuming the `.def`/Dockerfile/
+  `agy --help` inside the built image before assuming the `.def`/Dockerfile/
   entrypoint is wrong in some other way.

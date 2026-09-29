@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# entrypoint.sh - launch claude/codex/gemini non-interactively against a
+# entrypoint.sh - launch claude/codex/agy (Antigravity) non-interactively against a
 # directory of instructions. See ../README.md for the full I/O contract and
 # Singularity/Slurm usage examples.
 #
 # Usage:
-#   entrypoint.sh <claude|codex|gemini> <prompt-directory>
+#   entrypoint.sh <claude|codex|agy> <prompt-directory>
 #   AGENT=<...> PROMPT_DIR=<...> entrypoint.sh          (positional args win if both given)
 #
 # For an interactive shell (first-time CLI login, ad hoc work), bypass this
@@ -20,15 +20,15 @@ AGENT="${1:-${AGENT:-}}"
 PROMPT_DIR="${2:-${PROMPT_DIR:-}}"
 
 if [[ -z "$AGENT" || -z "$PROMPT_DIR" ]]; then
-  echo "Usage: entrypoint.sh <claude|codex|gemini> <prompt-directory>" >&2
-  echo "   or: AGENT=<claude|codex|gemini> PROMPT_DIR=<dir> entrypoint.sh" >&2
+  echo "Usage: entrypoint.sh <claude|codex|agy> <prompt-directory>" >&2
+  echo "   or: AGENT=<claude|codex|agy> PROMPT_DIR=<dir> entrypoint.sh" >&2
   exit 1
 fi
 
 case "$AGENT" in
-  claude|codex|gemini) ;;
+  claude|codex|agy) ;;
   *)
-    echo "Unknown agent '$AGENT' - expected claude, codex, or gemini" >&2
+    echo "Unknown agent '$AGENT' - expected claude, codex, or agy" >&2
     exit 1
     ;;
 esac
@@ -59,6 +59,13 @@ fi
 AGENT_MODEL="${AGENT_MODEL:-}"
 AGENT_EFFORT="${AGENT_EFFORT:-high}"
 
+# AGENT_VERBOSE - codex exec streams its whole working transcript (every command,
+# its output, reasoning notes) to stderr, where claude --print shows only the final
+# answer. By default that stream goes to '<RESPONSE_FILE>.log' in PROMPT_DIR instead
+# of the console, so the run is quiet but the transcript survives for debugging a
+# failed run. AGENT_VERBOSE=1 sends it back to the console. Codex only for now.
+AGENT_VERBOSE="${AGENT_VERBOSE:-0}"
+
 # API keys - accept the standard env var per provider. Codex also recognizes
 # CODEX_API_KEY specifically; mirror OPENAI_API_KEY into it if only the
 # former is set, so either name works without the caller needing to know
@@ -73,8 +80,8 @@ fi
 # the agent, not an access grant: a directory only becomes readable because it was
 # --bind mounted into the container (see README.md "Can I bind additional
 # directories for read?") - listing it here just tells the agent it exists and is
-# in scope, and (for claude) registers it as a first-class working directory via
-# --add-dir rather than an incidental read target. Entries that don't exist are
+# in scope, and (for claude and agy) registers it as a first-class working
+# directory via --add-dir rather than an incidental read target. Entries that don't exist are
 # warned about, not fatal - the caller may have forgotten to --bind one, but the
 # primary prompt/response task can still proceed without it.
 CONTEXT_DIRS="${CONTEXT_DIRS:-}"
@@ -116,36 +123,59 @@ case "$AGENT" in
     # for headless (--print) runs. --model is only passed when overridden.
     # --dangerously-skip-permissions: --print starts in Manual (read-only) mode
     # by default, which reads PROMPT_FILE fine but blocks writing RESPONSE_FILE.
+    # --add-dir is variadic (consumes every following non-flag argument), so it
+    # must come BEFORE the other flags - placed last, it swallows $WRAPPER as a
+    # directory and --print fails with "Input must be provided either through
+    # stdin or as a prompt argument".
     export CLAUDE_CODE_EFFORT_LEVEL="$AGENT_EFFORT"
-    claude_args=(--print --dangerously-skip-permissions)
-    [[ -n "$AGENT_MODEL" ]] && claude_args+=(--model "$AGENT_MODEL")
+    claude_args=()
     for d in "${CONTEXT_DIR_LIST[@]}"; do
       [[ -d "$d" ]] && claude_args+=(--add-dir "$d")
     done
+    claude_args+=(--print --dangerously-skip-permissions)
+    [[ -n "$AGENT_MODEL" ]] && claude_args+=(--model "$AGENT_MODEL")
     exec claude "${claude_args[@]}" "$WRAPPER"
     ;;
   codex)
     # --skip-git-repo-check: PROMPT_DIR is an arbitrary bound directory, not
-    # necessarily a git repo. --sandbox workspace-write: the response/marker
-    # files above must be writable. --ask-for-approval never: workspace-write
-    # alone controls what's technically permitted, not whether codex still
-    # pauses for human approval before using that permission - never is what
-    # actually makes the write happen unattended.
-    codex_args=(exec --skip-git-repo-check --sandbox workspace-write --ask-for-approval never -c "model_reasoning_effort=\"${AGENT_EFFORT}\"")
+    # necessarily a git repo.
+    # --dangerously-bypass-approvals-and-sandbox: codex's own sandbox is
+    # bubblewrap, which cannot build its mount namespace inside an Apptainer
+    # container - every shell command AND file write fails with "bwrap: Can't bind
+    # mount /oldroot/ on /newroot/: ... Invalid argument" (reproduced under default,
+    # --userns and --fakeroot on codex-cli 0.158). So `--sandbox workspace-write`
+    # is unusable here, and the container plus its bind mounts is the boundary -
+    # the same posture as claude and agy. See README.md "Security".
+    # The flag also sets approval to never, so --ask-for-approval is not needed.
+    codex_args=(exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -c "model_reasoning_effort=\"${AGENT_EFFORT}\"")
     [[ -n "$AGENT_MODEL" ]] && codex_args+=(-m "$AGENT_MODEL")
+    # Transcript redirect - see AGENT_VERBOSE above. Relative path is PROMPT_DIR
+    # (cd'd into above). Overwritten per run, like RESPONSE_FILE.
+    if [[ "$AGENT_VERBOSE" != "1" ]]; then
+      echo "codex transcript -> ${PROMPT_DIR%/}/${RESPONSE_FILE}.log (AGENT_VERBOSE=1 to show it here)" >&2
+      exec codex "${codex_args[@]}" "$WRAPPER" 2> "${RESPONSE_FILE}.log"
+    fi
     exec codex "${codex_args[@]}" "$WRAPPER"
     ;;
-  gemini)
-    # gemini-cli does not currently expose a stable CLI flag for thinking
-    # budget/reasoning effort (tracked upstream; see README.md) - AGENT_EFFORT
-    # is accepted for interface consistency with the other two agents but has
-    # no effect here yet. --yolo: bypasses all confirmation prompts (file
-    # writes and shell commands both), matching the other two agents' full
-    # unattended-in-a-container posture. --approval-mode auto_edit is a
-    # narrower alternative if a task only ever needs file reads/writes and
-    # never a shell command - see README.md.
-    gemini_args=(-p "$WRAPPER" --yolo)
-    [[ -n "$AGENT_MODEL" ]] && gemini_args+=(-m "$AGENT_MODEL")
-    exec gemini "${gemini_args[@]}"
+  agy)
+    # Antigravity CLI (agy), which replaced gemini-cli: Google stopped serving
+    # gemini-cli on the "Gemini Code Assist for individuals" tier, so a
+    # subscription login only works through agy. Flags verified against
+    # `agy --help` on agy 1.2.13.
+    # --dangerously-skip-permissions: in print mode agy soft-DENIES any tool that
+    # needs approval and still exits 0, so without it a run "succeeds" having
+    # written nothing. Same unattended-in-a-container posture as the other two.
+    # --effort accepts low|medium|high|max (no xhigh).
+    # --add-dir is repeatable, one directory per flag.
+    # -p goes LAST, immediately before the prompt: that parses correctly whether
+    # agy treats -p as a boolean with a positional prompt or as taking the prompt
+    # as its value.
+    agy_args=()
+    for d in "${CONTEXT_DIR_LIST[@]}"; do
+      [[ -d "$d" ]] && agy_args+=(--add-dir "$d")
+    done
+    agy_args+=(--dangerously-skip-permissions --effort "$AGENT_EFFORT")
+    [[ -n "$AGENT_MODEL" ]] && agy_args+=(--model "$AGENT_MODEL")
+    exec agy "${agy_args[@]}" -p "$WRAPPER"
     ;;
 esac

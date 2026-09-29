@@ -1,0 +1,168 @@
+# agentic_downstream_base - the slow, rarely-changing half of agentic_downstream: system
+# libraries plus the full R/Bioconductor stack. agentic_downstream.def builds on top of
+# the .sif this produces and adds only the fast-moving pieces (Node, the agent CLIs,
+# managed settings, entrypoint.sh). See README.md "Two-layer build" for why.
+#
+# Rebuild this ONLY when the R package set, the base image, or a system library changes.
+# Anything touching the agent CLIs or entrypoint.sh belongs in agentic_downstream.def.
+#
+# Keep in sync with Dockerfile.base (identical package content).
+
+Bootstrap: docker
+From: bioconductor/bioconductor_docker:RELEASE_3_20
+
+%labels
+    org.opencontainers.image.title agentic_downstream_base
+    org.opencontainers.image.description R/Bioconductor base layer for agentic_downstream - Seurat-free downstream single-cell analysis (SingleCellExperiment, UCell, DESeq2 pseudobulk DE, fgsea, SCPA, speckle/limma, harmony, ComplexHeatmap, survival modelling). No agent CLIs; build agentic_downstream.def on top of this.
+    org.opencontainers.image.source https://github.com/pirl-unc/singlecell_images
+    org.opencontainers.image.base.name bioconductor/bioconductor_docker:RELEASE_3_20
+    org.opencontainers.image.vendor Benjamin Vincent Lab, UNC Lineberger
+
+# Redirect R's personal user-library path to somewhere specific to this image, rather
+# than the host's generic ~/R/<arch>-library/<Rversion> default. Apptainer binds the
+# invoking user's real $HOME by default (and interactive agent use relies on that for
+# persisted OAuth credentials). Left at its default, R's per-user library sits ahead of
+# the container's own site-library in .libPaths(), so any package that also happens to
+# exist in the user's own (host, non-container) R library shadows this image's copy -
+# and if that host copy was compiled against a different R/BLAS/LAPACK build, loading
+# it fails with an unhelpful dyn.load() error that looks like a build problem but
+# isn't. See README.md "Gotchas". Follows the Rocker Project's own recommended fix
+# (rocker-project.org/use/singularity.html) - redirect, don't just disable.
+# ⚠ Repeated verbatim in agentic_downstream.def: a derived image's %environment
+# replaces this one rather than adding to it, so both must carry it.
+%environment
+    export R_LIBS_USER="${HOME}/R/agentic_downstream/4.4"
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # libmagick++-6.q16-9t64 is the ImageMagick runtime, required because
+    # SpatialExperiment imports magick - not because anything here uses ImageMagick.
+    # Runtime package, not -dev. Hits the same GSVA/clustermole/SCPA chain as
+    # ../singlecell_downstream. curl/gnupg/ca-certificates are also what the
+    # NodeSource setup in agentic_downstream.def needs, so they stay here.
+    apt-get update
+    apt-get install -y \
+        libmagick++-6.q16-9t64 \
+        libxml2-dev \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        libgsl-dev \
+        libfontconfig1-dev \
+        libfreetype6-dev \
+        libpng-dev \
+        libtiff5-dev \
+        libjpeg-dev \
+        libcairo2-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        cmake \
+        curl \
+        pkg-config \
+        git \
+        ca-certificates \
+        gnupg
+    rm -rf /var/lib/apt/lists/*
+
+    # bioconductor/bioconductor_docker:RELEASE_3_20 already configures a
+    # Posit-backed binary CRAN repo pointed at __linux__/noble (verified by
+    # inspection - see README.md "Gotchas"). Unlike ../singlecell_downstream's
+    # satijalab/seurat base, nothing needs to be added here for that.
+    Rscript -e "if (!requireNamespace('BiocManager', quietly=TRUE)) install.packages('BiocManager'); \
+                if (!requireNamespace('remotes', quietly=TRUE)) install.packages('remotes'); \
+                message('BiocManager ', BiocManager::version())"
+
+    # CRAN. Unlike ../singlecell_downstream, NONE of these arrive for free from a
+    # Seurat base image, so this list is broader: ggplot2/ggrepel/patchwork/Matrix/
+    # irlba/uwot/FNN/matrixStats/RColorBrewer are only implicit dependencies there.
+    Rscript -e "install.packages(c( \
+        'ggplot2', 'ggrepel', 'patchwork', 'Matrix', 'irlba', 'uwot', 'FNN', \
+        'matrixStats', 'RColorBrewer', \
+        'magrittr', 'data.table', 'dplyr', 'tidyr', 'tidytable', 'forcats', 'stringr', \
+        'viridis', 'colorspace', 'digest', 'qs2', 'segmented', \
+        'ggforce', 'ggnewscale', 'ggsignif', 'shadowtext', \
+        'harmony'))"
+
+    # HDF5 cluster rebuilt from source first - the base image's Rhdf5lib links a
+    # system szip that is not installed. Must precede anything reaching it via
+    # DelayedArray. Same fix as ../singlecell_downstream.
+    for pkg in Rhdf5lib rhdf5 HDF5Array; do
+        Rscript -e "BiocManager::install('${pkg}', update = FALSE, ask = FALSE, force = TRUE)"
+    done
+    # library() exits non-zero on failure (install.packages does not), so this fails
+    # the build here rather than 20 minutes later in the GSVA install.
+    Rscript -e "library(Rhdf5lib); library(rhdf5); library(HDF5Array); message('HDF5 stack OK')"
+
+    # Bioconductor
+    for pkg in SingleCellExperiment edgeR limma scuttle scater scran DESeq2 fgsea speckle UCell; do
+        Rscript -e "BiocManager::install('${pkg}', update = FALSE, ask = FALSE)"
+    done
+
+    # SCPA's dependency chain, in order. crossmatch and multicross are CRAN-archived;
+    # clustermole needs Bioconductor packages that install.packages() will not fetch.
+    Rscript -e "remotes::install_version('crossmatch', version='1.3.1', upgrade='never')"
+    Rscript -e "remotes::install_version('multicross', version='2.1.0', upgrade='never')"
+    for pkg in GSEABase GSVA singscore; do
+        Rscript -e "BiocManager::install('${pkg}', update = FALSE, ask = FALSE)"
+    done
+    Rscript -e "install.packages('clustermole')"
+
+    # GitHub packages via codeload + curl, pinned to commit SHAs. install_github()
+    # is avoided: it resolves refs through the rate-limited GitHub API.
+    # ComplexHeatmap must precede SCPA, which depends on it.
+    curl -fsSL -o /tmp/ComplexHeatmap.tar.gz \
+        https://codeload.github.com/jokergoo/ComplexHeatmap/tar.gz/ae0ec42cd2e4e0446c114d23dcf43cf2c2f585c8
+    Rscript -e "options(repos = BiocManager::repositories()); \
+                remotes::install_local('/tmp/ComplexHeatmap.tar.gz', upgrade='never')"
+    rm -f /tmp/ComplexHeatmap.tar.gz
+
+    curl -fsSL -o /tmp/SCPA.tar.gz \
+        https://codeload.github.com/jackbibby1/SCPA/tar.gz/68b6c9954a0eca82b4cfc990a963d5f5ca1f711b
+    Rscript -e "options(repos = BiocManager::repositories()); \
+                remotes::install_local('/tmp/SCPA.tar.gz', upgrade='never')"
+    rm -f /tmp/SCPA.tar.gz
+
+    # Fatal gate, here rather than in %test: R install failures are warnings, so
+    # nothing upstream catches a miss, and a failing %test does not fail an
+    # Apptainer build.
+    Rscript -e "required <- c( \
+        'SingleCellExperiment','DESeq2','fgsea','scran','scater','speckle','limma','UCell', \
+        'SCPA','clustermole','GSVA','ComplexHeatmap','harmony','survival','segmented','mgcv','Matrix', \
+        'magrittr','data.table','dplyr','tidyr','tidytable','forcats','stringr','viridis','colorspace', \
+        'digest','qs2','ggplot2','ggrepel','ggforce','ggnewscale','ggsignif','shadowtext','patchwork', \
+        'irlba','uwot','FNN','matrixStats','RColorBrewer'); \
+      missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]; \
+      if (length(missing)) { \
+        message('BUILD FAILED - required packages missing or unloadable: ', paste(missing, collapse=', ')); \
+        quit(status = 1) \
+      }; \
+      message('all ', length(required), ' required packages present and loadable')"
+
+%test
+    Rscript -e "invisible(lapply(c( \
+        'SingleCellExperiment','DESeq2','fgsea','scran','scater','speckle','limma','UCell', \
+        'SCPA','clustermole','GSVA','ComplexHeatmap','harmony','survival','segmented','mgcv','Matrix', \
+        'magrittr','data.table','dplyr','tidyr','tidytable','forcats','stringr','viridis','colorspace', \
+        'digest','qs2','ggplot2','ggrepel','ggforce','ggnewscale','ggsignif','shadowtext','patchwork', \
+        'irlba','uwot','FNN','matrixStats','RColorBrewer'), \
+        function(p) { library(p, character.only=TRUE); message(p, ' OK') }))"
+
+    # Informational - unused base-image packages with absent system libraries may
+    # be expected here; not fatal.
+    Rscript -e "pkgs <- rownames(installed.packages()); \
+        bad <- pkgs[!vapply(pkgs, function(p) isTRUE(tryCatch({loadNamespace(p); TRUE}, error=function(e) FALSE)), logical(1))]; \
+        if (length(bad)) message('NOTE - installed but not loadable: ', paste(bad, collapse=', ')) \
+        else message('all ', length(pkgs), ' installed packages load cleanly')"
+
+    Rscript -e "message('R ', getRversion(), ' | Bioc ', BiocManager::version())"
+
+%help
+    R/Bioconductor base layer for agentic_downstream. Contains no agent CLIs and no
+    runscript - build agentic_downstream.def on top of it rather than running it
+    directly. It is usable on its own for plain R work:
+
+        apptainer exec --bind /datastore,/home/$USER <image>.sif Rscript my_script.R
+        apptainer test <image>.sif
+
+    See README.md "Two-layer build" in the image repo (github.com/pirl-unc/singlecell_images).
