@@ -1,1 +1,4 @@
 .DS_store
+
+# RStudio session state (created when the repo is opened in RStudio)
+rstudio-os.sqlite*

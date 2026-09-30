@@ -45,6 +45,7 @@ itself isn't here to fall back on.
 - `agentic_run.sh` - **host-side** launcher: builds the `apptainer run` command with the
   flags that make the container boundary real (see "Batch use" and "Security"). Not
   part of the image; changing it needs no rebuild.
+- `build.sh` - builds either layer with its provenance recorded (see "Build", "Provenance")
 - `entrypoint.sh` - the batch-job launcher; copied into the final image (`%files` in the
   `.def`, `COPY` in the Dockerfile) and invoked by its `%runscript`/`ENTRYPOINT`
 
@@ -65,41 +66,66 @@ hardware.
 
 ## Build
 
-On a native **x86_64** host with Apptainer (1.2+, for `--build-arg`), from this
-directory. Base first - only when it doesn't exist yet or the R stack changed:
+Use **`build.sh`**, on a native **x86_64** host with Apptainer 1.2+ (for `--build-arg`). It
+records where the image came from (see "Provenance"), refuses to build from uncommitted changes,
+and refuses to overwrite an existing image file. Commit first, then build the base, but only when
+it doesn't exist yet or the R stack changed. Run the base build inside an allocation with ample
+memory (GSVA's byte-compile was OOM-killed once; 32G is plenty):
 
 ```bash
-export APPTAINER_TMPDIR=/datastore/scratch/users/$USER
-apptainer build --fakeroot \
-  /datastore/scratch/users/$USER/agentic_downstream_base_<base_version>.sif \
-  agentic_downstream_base.def
+./build.sh base  /datastore/scratch/users/$USER/agentic_downstream_base_<base_version>.sif
 ```
 
-Then the final image, pointed at that base:
+Then the final image on top of that base (minutes):
 
 ```bash
-apptainer build --fakeroot \
-  --build-arg BASE_IMAGE=/path/to/agentic_downstream_base_<base_version>.sif \
-  /datastore/scratch/users/$USER/agentic_downstream_<version>.sif \
-  agentic_downstream.def
+./build.sh final /datastore/scratch/users/$USER/agentic_downstream_<version>.sif \
+                 /path/to/agentic_downstream_base_<base_version>.sif
 ```
 
-`BASE_IMAGE` defaults to `agentic_downstream_base.sif` in the current directory if not
-passed. `--fakeroot` works without an `/etc/subuid` entry - Apptainer falls back to a
-root-mapped user namespace, sufficient for `apt-get install`/`npm install -g` on a
-glibc base. Build into scratch, then move each `.sif` to its final directory. **Keep
-the base `.sif`** - deleting it means the next CLI or entrypoint change costs the full
-hour again.
+`ALLOW_DIRTY=1` builds from uncommitted changes anyway (recorded as `git_dirty=true`); `FORCE=1`
+overwrites an existing output. **Give every build a new version**: reusing a name makes two
+different images indistinguishable by filename, as happened once with `0.0.3`.
+
+`--fakeroot` works without an `/etc/subuid` entry - Apptainer falls back to a root-mapped user
+namespace, sufficient for `apt-get install`/`npm install -g` on a glibc base. Build into scratch,
+then move each `.sif` to its final directory. **Keep the base `.sif`** - deleting it means the
+next CLI or entrypoint change costs the full hour again.
+
+The raw `apptainer build` commands still work (`--build-arg BASE_IMAGE=...` for the final layer);
+the provenance fields are then recorded as `unknown`.
 
 Docker equivalent, if building on amd64 hardware:
 
 ```bash
 docker build --platform linux/amd64 -f Dockerfile.base \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg GIT_DIRTY=false \
   -t benjaminvincentlab/agentic_downstream_base:<base_version> .
 docker build --platform linux/amd64 \
   --build-arg BASE_IMAGE=benjaminvincentlab/agentic_downstream_base:<base_version> \
+  --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg GIT_DIRTY=false \
   -t benjaminvincentlab/agentic_downstream:<version> .
 ```
+
+### Provenance
+
+Each image records the commit it was built from, because the agent CLIs are unpinned: two builds
+of the same commit can contain different claude/codex/agy versions, and those versions change
+behaviour (codex 0.158 → 0.159 changed which flags it accepts). Recorded:
+
+| Where | What |
+|---|---|
+| Labels (`apptainer inspect --labels <image>`) | `org.opencontainers.image.revision` (commit), `agentic_downstream.git_dirty`, and for the final layer `agentic_downstream.base_image` + `agentic_downstream.base_sha256` |
+| `/etc/agentic_downstream/build_info` (final layer) | commit, dirty flag, base image path and SHA-256, build time (UTC), claude / codex / agy / node versions |
+| `/etc/agentic_downstream/base_build_info` (base layer, inherited) | commit, dirty flag, build time, R and Bioconductor versions |
+| Every run's log | `entrypoint.sh` prints one line - commit, build time and CLI versions - before starting the agent |
+
+```bash
+apptainer inspect --labels <image> | grep -E 'revision|git_dirty|base_'
+apptainer exec <image> cat /etc/agentic_downstream/build_info /etc/agentic_downstream/base_build_info
+```
+
+Images built before this was added (0.0.3 and earlier) have none of it; `entrypoint.sh` says so.
 
 ### Two-layer build
 

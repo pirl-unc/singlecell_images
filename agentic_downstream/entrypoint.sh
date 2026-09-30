@@ -56,6 +56,17 @@ if [[ ! -f "$PROMPT_DIR/$PROMPT_FILE" ]]; then
   exit 1
 fi
 
+# One line identifying the image, so every run's log records what it ran on: the repo commit
+# and the CLI versions baked in at build time (the CLIs are unpinned, so the commit alone does
+# not identify them). Written by the .def's %post; absent on images built before 2026-09-30.
+BUILD_INFO=/etc/agentic_downstream/build_info
+if [[ -r "$BUILD_INFO" ]]; then
+  bi() { sed -n "s/^$1=//p" "$BUILD_INFO" | head -1; }
+  echo "agentic_downstream build: commit $(bi git_sha | cut -c1-12) (dirty=$(bi git_dirty)), built $(bi built_utc); claude $(bi claude | cut -d' ' -f1), $(bi codex), agy $(bi agy)" >&2
+else
+  echo "agentic_downstream build: no build record in this image (built before provenance was added)" >&2
+fi
+
 # Model / reasoning-effort defaults. Left unset (empty) by default so each
 # CLI falls back to its own current default model rather than this script
 # pinning a model id that goes stale as providers ship new ones. AGENT_EFFORT

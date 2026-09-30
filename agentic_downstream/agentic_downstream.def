@@ -16,8 +16,14 @@
 Bootstrap: localimage
 From: {{ BASE_IMAGE }}
 
+# Build provenance. build.sh fills these in; a bare `apptainer build` gets "unknown", which
+# is visible in `apptainer inspect --labels` rather than silently absent. See README.md
+# "Provenance".
 %arguments
     BASE_IMAGE=agentic_downstream_base.sif
+    BASE_SHA256=unknown
+    GIT_SHA=unknown
+    GIT_DIRTY=unknown
 
 %files
     entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -28,6 +34,10 @@ From: {{ BASE_IMAGE }}
     org.opencontainers.image.source https://github.com/pirl-unc/singlecell_images
     org.opencontainers.image.base.name agentic_downstream_base
     org.opencontainers.image.vendor Benjamin Vincent Lab, UNC Lineberger
+    org.opencontainers.image.revision {{ GIT_SHA }}
+    agentic_downstream.git_dirty {{ GIT_DIRTY }}
+    agentic_downstream.base_image {{ BASE_IMAGE }}
+    agentic_downstream.base_sha256 {{ BASE_SHA256 }}
 
 # Repeated verbatim from agentic_downstream_base.def: a derived image's %environment
 # replaces the base's rather than adding to it, so dropping this line here would
@@ -126,6 +136,26 @@ MANAGED_SETTINGS
     claude --version
     codex --version
     agy --version
+
+    # Build record. The CLIs are unpinned (latest at build time), so the same commit can
+    # produce different images - the commit alone does not identify what is inside. Written as
+    # KEY=value lines; entrypoint.sh prints a one-line summary of it at the start of every run.
+    # The base layer's own record is alongside, in base_build_info.
+    mkdir -p /etc/agentic_downstream
+    {
+        echo "image=agentic_downstream"
+        echo "git_sha={{ GIT_SHA }}"
+        echo "git_dirty={{ GIT_DIRTY }}"
+        echo "base_image={{ BASE_IMAGE }}"
+        echo "base_sha256={{ BASE_SHA256 }}"
+        echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "claude=$(claude --version 2>/dev/null | head -1)"
+        echo "codex=$(codex --version 2>/dev/null | tail -1)"
+        echo "agy=$(agy --version 2>/dev/null | tail -1)"
+        echo "node=$(node --version)"
+    } > /etc/agentic_downstream/build_info
+    chmod 644 /etc/agentic_downstream/build_info
+    cat /etc/agentic_downstream/build_info
 
 %test
     # The full per-package R check is the base image's %test (apptainer test

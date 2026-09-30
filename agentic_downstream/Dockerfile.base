@@ -135,3 +135,19 @@ RUN Rscript -e "message('R ', getRversion(), ' | Bioc ', BiocManager::version())
 # .def - see agentic_downstream_base.def %environment and README.md "Gotchas". Docker
 # ENV is inherited by the derived Dockerfile, unlike Apptainer's %environment.
 ENV R_LIBS_USER=/opt/r-libs-user
+
+# Build provenance, mirroring agentic_downstream_base.def:
+#   --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg GIT_DIRTY=<true|false>
+ARG GIT_SHA=unknown
+ARG GIT_DIRTY=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL agentic_downstream.git_dirty="${GIT_DIRTY}"
+RUN mkdir -p /etc/agentic_downstream && { \
+      echo "image=agentic_downstream_base"; \
+      echo "git_sha=${GIT_SHA}"; \
+      echo "git_dirty=${GIT_DIRTY}"; \
+      echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+      echo "from=bioconductor/bioconductor_docker:RELEASE_3_20"; \
+      echo "r=$(Rscript -e 'cat(as.character(getRversion()))')"; \
+      echo "bioc=$(Rscript -e 'cat(as.character(BiocManager::version()))')"; \
+    } > /etc/agentic_downstream/base_build_info && chmod 644 /etc/agentic_downstream/base_build_info

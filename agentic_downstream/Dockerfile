@@ -11,6 +11,7 @@
 
 ARG BASE_IMAGE=benjaminvincentlab/agentic_downstream_base:latest
 FROM --platform=linux/amd64 ${BASE_IMAGE}
+ARG BASE_IMAGE
 
 LABEL org.opencontainers.image.title="agentic_downstream"
 LABEL org.opencontainers.image.description="Seurat-free downstream single-cell analysis (SingleCellExperiment, UCell, DESeq2 pseudobulk DE, fgsea, SCPA, speckle/limma, harmony, ComplexHeatmap, survival modelling) plus claude/codex/agy (Antigravity) CLI agents for cluster-based agentic review workflows."
@@ -84,6 +85,30 @@ RUN mkdir -p /etc/claude-code && \
 
 RUN node --version && npm --version && \
     claude --version && codex --version && agy --version
+
+# Build provenance, mirroring agentic_downstream.def: pass with
+#   --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg GIT_DIRTY=<true|false>
+#   --build-arg BASE_SHA256=<digest of the base image>
+# Placed after the expensive layers so a new commit only invalidates the layers below.
+ARG GIT_SHA=unknown
+ARG GIT_DIRTY=unknown
+ARG BASE_SHA256=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL agentic_downstream.git_dirty="${GIT_DIRTY}"
+LABEL agentic_downstream.base_image="${BASE_IMAGE}"
+LABEL agentic_downstream.base_sha256="${BASE_SHA256}"
+RUN mkdir -p /etc/agentic_downstream && { \
+      echo "image=agentic_downstream"; \
+      echo "git_sha=${GIT_SHA}"; \
+      echo "git_dirty=${GIT_DIRTY}"; \
+      echo "base_image=${BASE_IMAGE}"; \
+      echo "base_sha256=${BASE_SHA256}"; \
+      echo "built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+      echo "claude=$(claude --version 2>/dev/null | head -1)"; \
+      echo "codex=$(codex --version 2>/dev/null | tail -1)"; \
+      echo "agy=$(agy --version 2>/dev/null | tail -1)"; \
+      echo "node=$(node --version)"; \
+    } > /etc/agentic_downstream/build_info && chmod 644 /etc/agentic_downstream/build_info
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
