@@ -66,6 +66,16 @@ From: {{ BASE_IMAGE }}
     npm install -g \
         @anthropic-ai/claude-code \
         @openai/codex
+    # codex's native binary ships as an OPTIONAL dependency
+    # (@openai/codex-linux-x64, an alias of @openai/codex@<ver>-linux-x64, ~70 MB).
+    # npm silently skips an optional dependency it fails to fetch, so a transient
+    # registry error leaves codex.js with no binary and the build only fails later,
+    # at `codex --version`, with "Missing optional dependency" (seen on 0.159.2).
+    # Installing it by name, pinned to the version just installed, makes a failed
+    # fetch a hard npm error here. It lands as a global sibling, which codex.js's
+    # require.resolve finds.
+    CODEX_VERSION="$(node -p "require('$(npm root -g)/@openai/codex/package.json').version")"
+    npm install -g "@openai/codex-linux-x64@npm:@openai/codex@${CODEX_VERSION}-linux-x64"
     npm cache clean --force
 
     # Antigravity CLI (agy) - replaces @google/gemini-cli, which Google no longer
@@ -141,18 +151,25 @@ MANAGED_SETTINGS
         apptainer exec --bind /datastore,/home/$USER <image>.sif R
         apptainer test <image>.sif
 
-        # Interactive agent login / ad hoc CLI use (bypasses %runscript)
-        apptainer shell --bind /home/$USER <image>.sif
+        # AGENTS: every agent launch needs --no-home --no-mount hostfs,cwd. Where the
+        # site sets `mount hostfs = yes`, all host network filesystems are otherwise
+        # mounted read-write whatever --bind/--no-home say, and the agents run with
+        # permission checks off. entrypoint.sh refuses to start if they are exposed.
+        # See README.md "Security".
 
-        # Batch agent run (uses %runscript -> entrypoint.sh). --no-home: batch auth
-        # is API-key based, so $HOME isn't needed - see README.md "Security" for
-        # why omitting --no-home would expose your whole home directory here.
-        apptainer run --no-home --bind /path/to/shared/dir \
-          --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-          <image>.sif claude /path/to/shared/dir
+        # Interactive agent login (bypasses %runscript) - bind only that agent's
+        # credentials, e.g. agy:
+        apptainer shell --cleanenv --no-home --no-mount hostfs,cwd \
+          --bind "$HOME/.gemini:$HOME/.gemini" <image>.sif
 
-        # Same, with an edited entrypoint.sh and no rebuild
-        apptainer run --no-home --bind /path/to/shared/dir \
-          --bind /path/to/entrypoint.sh:/path/to/entrypoint.sh:ro \
-          --env ENTRYPOINT_OVERRIDE=/path/to/entrypoint.sh \
-          <image>.sif claude /path/to/shared/dir
+        # Batch agent run: use agentic_run.sh from the image repo, which adds the
+        # flags above, binds the agent's own credentials and context dirs read-only
+        agentic_run.sh -i <image>.sif [-c /path/to/context] claude /path/to/prompt_dir
+
+        # raw equivalent (claude needs both ~/.claude and ~/.claude.json)
+        apptainer run --cleanenv --no-home --no-mount hostfs,cwd --bind /path/to/prompt_dir \
+          --bind "$HOME/.claude:$HOME/.claude" --bind "$HOME/.claude.json:$HOME/.claude.json" \
+          <image>.sif claude /path/to/prompt_dir
+
+        # Test an edited entrypoint.sh with no rebuild
+        agentic_run.sh -i <image>.sif -o /path/to/entrypoint.sh claude /path/to/prompt_dir

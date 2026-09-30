@@ -7,9 +7,14 @@
 #   entrypoint.sh <claude|codex|agy> <prompt-directory>
 #   AGENT=<...> PROMPT_DIR=<...> entrypoint.sh          (positional args win if both given)
 #
+# Launch it through agentic_run.sh on the host, which adds the flags that make the
+# container boundary real (--no-home --no-mount hostfs,cwd). This script refuses to
+# start an agent if undeclared network filesystems are mounted - see the mount
+# boundary check below and README.md "Security".
+#
 # For an interactive shell (first-time CLI login, ad hoc work), bypass this
-# script entirely:
-#   singularity shell --bind "$HOME" image.sif
+# script entirely, binding only the credentials that agent needs:
+#   apptainer shell --no-home --no-mount hostfs,cwd --bind "$HOME/.gemini:$HOME/.gemini" image.sif
 #   docker run -it --entrypoint bash image
 # `singularity shell`/`exec` and Docker's --entrypoint override both ignore
 # this script by design, so no interactive branch is needed here.
@@ -78,8 +83,8 @@ fi
 # read for context (e.g. the actual project being reviewed), distinct from
 # PROMPT_DIR where the prompt/response contract lives. This is documentation for
 # the agent, not an access grant: a directory only becomes readable because it was
-# --bind mounted into the container (see README.md "Can I bind additional
-# directories for read?") - listing it here just tells the agent it exists and is
+# --bind mounted into the container (see README.md "Additional context
+# directories") - listing it here just tells the agent it exists and is
 # in scope, and (for claude and agy) registers it as a first-class working
 # directory via --add-dir rather than an incidental read target. Entries that don't exist are
 # warned about, not fatal - the caller may have forgotten to --bind one, but the
@@ -99,6 +104,62 @@ for d in "${CONTEXT_DIR_LIST[@]}"; do
   fi
 done
 
+# Mount boundary check. The agents run with their permission checks off, so the only
+# real boundary is what the container can see - and that is decided on the host's
+# apptainer command line, not in this image. A site config with `mount hostfs = yes`
+# (the UNC LBG cluster, measured 2026-09-30) mounts every host network filesystem
+# read-write into every container unless the launch passes `--no-mount hostfs`,
+# silently exposing all of /datastore and /home whatever --bind/--no-home say. See
+# README.md "Security".
+# Rule: every network-filesystem mount must be a path this run declared - PROMPT_DIR,
+# a CONTEXT_DIRS entry, an agent credential path, or an EXTRA_ALLOWED_MOUNTS entry.
+# hostfs shows up as whole exports (/datastore/nextgenout5, other users' /home/*), so
+# anything else refuses the run. ALLOW_HOSTFS=1 overrides, for a deliberate exception.
+# A passing check exports AGENTIC_BOUNDARY_CHECKED=1 so that an in-container
+# orchestrator calling this script again for sub-agents (typically with a subfolder
+# as PROMPT_DIR, whose parent mount would otherwise look undeclared) is not refused.
+# This catches a forgotten launch flag; it is not a defence against a hostile agent,
+# which can set that variable itself.
+ALLOW_HOSTFS="${ALLOW_HOSTFS:-0}"
+EXTRA_ALLOWED_MOUNTS="${EXTRA_ALLOWED_MOUNTS:-}"
+if [[ "$ALLOW_HOSTFS" != "1" && "${AGENTIC_BOUNDARY_CHECKED:-0}" != "1" ]]; then
+  allowed_mounts=("$(realpath -m "$PROMPT_DIR")")
+  for d in "${CONTEXT_DIR_LIST[@]}"; do allowed_mounts+=("$(realpath -m "$d")"); done
+  for c in .claude .claude.json .codex .gemini; do allowed_mounts+=("${HOME%/}/$c"); done
+  # an ENTRYPOINT_OVERRIDE script is itself a bind mount (this very file, when testing)
+  [[ -n "${ENTRYPOINT_OVERRIDE:-}" ]] && allowed_mounts+=("$(realpath -m "$ENTRYPOINT_OVERRIDE")")
+  if [[ -n "$EXTRA_ALLOWED_MOUNTS" ]]; then
+    IFS=':' read -ra extra_mounts <<< "$EXTRA_ALLOWED_MOUNTS"
+    for d in "${extra_mounts[@]}"; do allowed_mounts+=("$(realpath -m "$d")"); done
+  fi
+  unexpected_mounts=()
+  while read -r fstype mnt; do
+    case "$fstype" in
+      nfs|nfs4|cifs|smb3|lustre|gpfs|beegfs|ceph|autofs) ;;
+      *) continue ;;
+    esac
+    [[ "$mnt" == /proc/* ]] && continue   # binfmt_misc automount, present either way
+    ok=0
+    for a in "${allowed_mounts[@]}"; do
+      [[ "$mnt" == "${a%/}" ]] && { ok=1; break; }
+    done
+    (( ok )) || unexpected_mounts+=("$mnt")
+  done < <(awk '{print $3, $2}' /proc/mounts)
+  if (( ${#unexpected_mounts[@]} )); then
+    {
+      echo "REFUSING TO RUN: network filesystems are mounted that this run did not declare:"
+      printf '  %s\n' "${unexpected_mounts[@]:0:10}"
+      (( ${#unexpected_mounts[@]} > 10 )) && echo "  ... and $(( ${#unexpected_mounts[@]} - 10 )) more"
+      echo "The agent would run with its permission checks off and read/write access to all of these."
+      echo "Most likely the launch is missing '--no-mount hostfs,cwd' (see README.md \"Security\"),"
+      echo "or use agentic_run.sh, which always adds it. If a mount is intended, list it in"
+      echo "EXTRA_ALLOWED_MOUNTS (colon-separated); ALLOW_HOSTFS=1 skips this check entirely."
+    } >&2
+    exit 1
+  fi
+  export AGENTIC_BOUNDARY_CHECKED=1
+fi
+
 WRAPPER="You are being run as the '${AGENT}' agent in a non-interactive batch job. \
 Your task is described in the file '${PROMPT_FILE}' in the current directory (${PROMPT_DIR}) - read it and follow its instructions. \
 Unless it tells you to write your output somewhere else, write your complete response to a file named '${RESPONSE_FILE}' in this same directory, \
@@ -117,6 +178,14 @@ cd "$PROMPT_DIR"
 # vendor's own docs recommend the equivalent full-bypass flag for exactly that
 # case (e.g. Claude Code's docs list `claude -p "<prompt>" --dangerously-skip-permissions`
 # under "Run fully unattended inside a container"). See README.md "Gotchas".
+
+# stdin from /dev/null for every agent. With a non-terminal stdin that is never
+# closed (a batch job, or a call from inside an orchestrating agent), `codex exec`
+# prints "Reading additional input from stdin..." and waits for EOF before starting -
+# indefinitely (found 2026-09-30). claude --print also reads a non-terminal stdin.
+# No agent here takes input on stdin; the prompt is always an argument.
+exec < /dev/null
+
 case "$AGENT" in
   claude)
     # CLAUDE_CODE_EFFORT_LEVEL takes precedence over other effort settings

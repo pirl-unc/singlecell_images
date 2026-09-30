@@ -42,6 +42,9 @@ itself isn't here to fall back on.
   of the base `.sif`: Node, the agent CLIs, managed settings, `entrypoint.sh`. Minutes.
 - `Dockerfile.base` / `Dockerfile` - equivalent Docker recipes for the same two layers,
   kept as a portable record
+- `agentic_run.sh` - **host-side** launcher: builds the `apptainer run` command with the
+  flags that make the container boundary real (see "Batch use" and "Security"). Not
+  part of the image; changing it needs no rebuild.
 - `entrypoint.sh` - the batch-job launcher; copied into the final image (`%files` in the
   `.def`, `COPY` in the Dockerfile) and invoked by its `%runscript`/`ENTRYPOINT`
 
@@ -123,14 +126,18 @@ Dockerfile pair sets it only in `Dockerfile.base`.
 ### Testing an entrypoint change
 
 No rebuild needed. `%runscript` runs `$ENTRYPOINT_OVERRIDE` if set, falling back to the
-baked-in `/usr/local/bin/entrypoint.sh` otherwise. Bind the edited script in and point
-at it:
+baked-in `/usr/local/bin/entrypoint.sh` otherwise. `agentic_run.sh -o` binds the edited
+script in and points at it:
 
 ```bash
-apptainer run --no-home --bind /path/to/shared/dir \
+./agentic_run.sh -i <image> -o ./entrypoint.sh claude /path/to/prompt_dir
+
+# raw equivalent
+apptainer run --cleanenv --no-home --no-mount hostfs,cwd --bind /path/to/prompt_dir \
+  --bind "$HOME/.claude:$HOME/.claude" --bind "$HOME/.claude.json:$HOME/.claude.json" \
   --bind /path/to/entrypoint.sh:/path/to/entrypoint.sh:ro \
   --env ENTRYPOINT_OVERRIDE=/path/to/entrypoint.sh \
-  agentic_downstream.sif claude /path/to/shared/dir
+  <image> claude /path/to/prompt_dir
 ```
 
 It is invoked via `bash`, so the bound file needs no execute bit. Once it works, rebuild
@@ -179,45 +186,77 @@ stack is the base layer unchanged, so it does not repeat the full package check.
 ## Interactive use (login, ad hoc work)
 
 `%runscript` (what `apptainer run` invokes) expects an agent name + directory - see
-"Batch use" below. For interactive use, including the one-time OAuth login each CLI
-needs before it can run without an API key, bypass it entirely:
+"Batch use" below. For interactive use, including the one-time login each CLI needs
+before it can run on a subscription, bypass it with `apptainer shell`, which ignores
+`%runscript` by design.
+
+**Log in from a shell that sees only that agent's credential location**, the same view
+a batch run will have. A login made from a shell that can see all of `$HOME` (plain
+`apptainer shell`, or any launch while the site's hostfs mounts are on - see
+"Security") can save its token somewhere a restricted batch run cannot see.
 
 ```bash
-apptainer shell --bind "$HOME" <image>.sif
-apptainer exec --bind "$HOME" <image>.sif bash
+# claude (then /login)             codex (then codex login --device-auth)
+apptainer shell --cleanenv --no-home --no-mount hostfs,cwd \
+  --bind "$HOME/.claude:$HOME/.claude" --bind "$HOME/.claude.json:$HOME/.claude.json" <image>
+apptainer shell --cleanenv --no-home --no-mount hostfs,cwd --bind "$HOME/.codex:$HOME/.codex" <image>
+
+# agy (then run `agy`, open the printed URL, paste the code back)
+apptainer shell --cleanenv --no-home --no-mount hostfs,cwd --bind "$HOME/.gemini:$HOME/.gemini" <image>
 
 # Docker equivalent
 docker run -it --entrypoint bash benjaminvincentlab/agentic_downstream:<version>
 ```
 
-`apptainer shell`/`exec` ignore `%runscript` by design. From that shell, run `claude`,
-`codex`, or `agy` directly. Apptainer binds the real host `$HOME` and runs the
-container process as the invoking user (not root, not a baked-in image user), so
-credentials from an interactive login land in `~/.claude`, `~/.codex`, `~/.gemini` (agy's) on
-your actual home directory and persist across future runs - both interactive and
-batch.
+Create any credential path that does not exist yet before binding it
+(`mkdir -p ~/.codex ~/.gemini ~/.claude; touch ~/.claude.json`). Apptainer runs the
+container as the invoking user, so credentials land in your real home directory and
+persist across runs. Add `--bind /some/work/dir --pwd /some/work/dir` for ad hoc work in
+a particular folder.
 
 ## Batch use (the plan-review workflow)
 
-Batch/sbatch jobs use `--no-home` and bind **only** the specific prompt directory -
-not `$HOME` - API-key auth doesn't need it, and subscription auth needs only one
-credential directory (see "Subscription login for batch runs"). See "Security"
-below for why this matters: without `--no-home`, Apptainer auto-binds your entire real
-home directory by default, giving an unattended job read/write/delete access far
-beyond the one directory it actually needs.
+**Use `agentic_run.sh`** (in this directory, runs on the host). It always adds the
+launch flags that make the container boundary real - `--no-home --no-mount hostfs,cwd`
+(see "Security") - binds only the running agent's credentials, binds context
+directories read-only, resolves symlinked paths such as `~/nate/...` to their real
+location, and unsets API key variables so subscription logins are used.
 
 ```bash
-apptainer run --no-home --bind /path/to/shared/dir \
-  --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  agentic_downstream.sif claude /path/to/shared/dir
+export AGENTIC_IMG=/path/to/benjaminvincentlab-agentic-downstream-<version>.img
 
-# equivalently, via env vars instead of positional args:
-AGENT=codex PROMPT_DIR=/path/to/shared/dir \
-  apptainer run --no-home --bind /path/to/shared/dir --env OPENAI_API_KEY="$OPENAI_API_KEY" \
-  agentic_downstream.sif
+./agentic_run.sh claude /path/to/prompt_dir
+./agentic_run.sh -c /path/to/project codex /path/to/prompt_dir          # + read-only context
+./agentic_run.sh -e AGENT_MODEL=<id> -e AGENT_EFFORT=max agy /path/to/prompt_dir
+./agentic_run.sh -a -c /path/to/project claude /path/to/prompt_dir     # orchestrator: all creds
+./agentic_run.sh -n codex /path/to/prompt_dir                          # print the command only
 ```
 
-Example `sbatch` script for spinning up a codex review job:
+Options: `-c DIR` context (read-only, repeatable), `-b SRC[:DST[:ro]]` extra bind,
+`-a` bind every agent's credentials (for an in-container orchestrator that launches the
+others), `-e KEY=VAL` pass a variable in, `-o FILE` test an edited `entrypoint.sh`,
+`-k` keep API key variables, `-n` dry run. `./agentic_run.sh -h` prints the full usage.
+
+The raw command it builds, for when the script is not available:
+
+```bash
+apptainer run --cleanenv --no-home --no-mount hostfs,cwd \
+  --bind /path/to/prompt_dir \
+  --bind "$HOME/.codex:$HOME/.codex" \
+  --bind /path/to/project:/path/to/project:ro --env CONTEXT_DIRS=/path/to/project \
+  <image> codex /path/to/prompt_dir
+```
+
+**`entrypoint.sh` refuses to start an agent if the launch flags were missed.** It
+checks `/proc/mounts` for network filesystems the run did not declare (the prompt
+directory, `CONTEXT_DIRS`, the credential paths, `EXTRA_ALLOWED_MOUNTS`) and exits with
+`REFUSING TO RUN` and the list of exposed mounts - which is what a launch without
+`--no-mount hostfs` produces on this cluster. `ALLOW_HOSTFS=1` skips the check for a
+deliberate exception. A passing check is inherited by nested calls, so an in-container
+orchestrator can call `entrypoint.sh` again for sub-agents. It is a guard against a
+forgotten flag, not against a hostile agent.
+
+Example `sbatch` script for a codex review job:
 
 ```bash
 #!/bin/bash
@@ -225,18 +264,8 @@ Example `sbatch` script for spinning up a codex review job:
 #SBATCH --time=00:30:00
 #SBATCH --mem=4G
 
-apptainer run --no-home --bind /proj/shared/plan_review \
-  --env OPENAI_API_KEY="$OPENAI_API_KEY" \
-  agentic_downstream.sif codex /proj/shared/plan_review
+/path/to/agentic_run.sh -i /path/to/<image> codex /proj/shared/plan_review
 ```
-
-`agy`'s equivalent job runs `agentic_downstream.sif agy /proj/shared/plan_review`,
-authenticated by subscription login (see "Subscription login for batch runs") or by
-`GEMINI_API_KEY` (see "API keys").
-
-Interactive use (above) is the one case that *should* still bind `$HOME` - that's how
-a one-time OAuth login persists across runs. The distinction is deliberate: bind
-`$HOME` for a human-driven login session, never for an unattended batch job.
 
 ### Env var passthrough caveat
 
@@ -248,8 +277,8 @@ Singularity installs), e.g.:
 
 ```bash
 APPTAINERENV_OPENAI_API_KEY="$OPENAI_API_KEY" \
-  apptainer run --cleanenv --bind /proj/shared/plan_review \
-  agentic_downstream.sif codex /proj/shared/plan_review
+  apptainer run --cleanenv --no-home --no-mount hostfs,cwd --bind /proj/shared/plan_review \
+  <image> codex /proj/shared/plan_review
 ```
 
 Check whether your Slurm job template uses `--cleanenv` before assuming a bare
@@ -263,9 +292,8 @@ Check whether your Slurm job template uses `--cleanenv` before assuming a bare
 | codex | `OPENAI_API_KEY` (mirrored to `CODEX_API_KEY` automatically by `entrypoint.sh` if only `OPENAI_API_KEY` is set) |
 | agy | `GEMINI_API_KEY` - **and** `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`; per Google's docs either alone has no effect |
 
-API keys bill the provider's API. Interactive sessions that have already done a
-one-time OAuth login (see above) don't need them, since credentials persist in the
-bound `$HOME` - and batch runs can use that same login instead, see below.
+API keys bill the provider's API. Batch runs can use a stored subscription login
+instead, see below. `agentic_run.sh` unsets all four key variables unless given `-k`.
 
 Never pass a key as `--env KEY="$KEY"`: the shell expands it onto the command line,
 where other users on a shared node can read it from `ps` / `/proc/<pid>/cmdline`. Keep
@@ -275,42 +303,30 @@ Apptainer's default environment passthrough carry it in (or use `--env-file`).
 ### Subscription login for batch runs
 
 To bill a ChatGPT / Claude / Google AI subscription rather than the API, log in once
-interactively, then bind **only** that agent's credential directory into batch jobs.
-Using codex as the example:
+from a restricted shell (see "Interactive use"), then bind **only** that agent's
+credential location into batch runs - which `agentic_run.sh` does by default.
 
-```bash
-# once - --device-auth because the default browser-callback login cannot complete
-# on a headless node; it prints a URL + code to enter on any other machine
-apptainer shell --bind "$HOME" agentic_downstream.sif
-codex login --device-auth
-codex login status
-
-# each batch run
-unset OPENAI_API_KEY CODEX_API_KEY
-apptainer run --no-home \
-  --bind "$HOME/.codex:$HOME/.codex" \
-  --bind /path/to/shared/dir \
-  agentic_downstream.sif codex /path/to/shared/dir
-```
+| Agent | Log in with | Credential location to bind |
+|---|---|---|
+| claude | `/login` in an interactive `claude` | `~/.claude` **and** `~/.claude.json` |
+| codex | `codex login --device-auth` (the browser-callback login cannot complete on a headless node) | `~/.codex` |
+| agy | run `agy`, open the printed URL, paste the code back | `~/.gemini` |
 
 - **Unset the API key variables.** Host env passes through by default and
   `entrypoint.sh` mirrors `OPENAI_API_KEY` into `CODEX_API_KEY`; a key that is present
   is expected to take precedence over the stored login and bill the API.
-- **Bind the credential directory writable**, not `:ro` - the CLI refreshes its token
-  in place.
+- **Bind credential paths writable**, not `:ro` - the CLIs refresh tokens in place.
 - **The agent can read that token.** It runs with a full permission bypass, so this is
-  the cost of subscription auth; binding one credential directory rather than `$HOME`
-  keeps it to that one credential.
-- claude is the same with `~/.claude`.
-- **agy** (Antigravity) uses `~/.gemini`: log in by running `agy` interactively once
-  (on a headless node it prints a URL and waits for an authorization code to be pasted
-  back), then bind `"$HOME/.gemini:$HOME/.gemini"`. agy prefers the OS keyring (D-Bus
-  Secret Service), which does not exist inside the container; its binary carries a
-  file-based fallback for that case (`Using file-based token storage because %s
-  detected`), so the login is **expected** to land as a file under `~/.gemini` -
-  unverified until the first login, so confirm a file appears there and that a
-  following `--no-home` batch run authenticates. Unset `GEMINI_API_KEY` for
-  subscription runs, for the same reason as the codex keys above.
+  the cost of subscription auth; binding one agent's credentials rather than `$HOME`
+  keeps it to that one.
+- **Check a login the way batch will use it**, e.g. for agy:
+  `apptainer exec --cleanenv --no-home --no-mount hostfs,cwd --bind "$HOME/.gemini:$HOME/.gemini" <image> agy --dangerously-skip-permissions -p "Reply only OK."`
+  should print `OK`; a login URL means the token is not in the bound location.
+- **agy** prefers the OS keyring (D-Bus Secret Service), which does not exist inside the
+  container; it falls back to file storage under `~/.gemini` (`Using file-based token
+  storage because %s detected`). **Unverified** that the token lands in `~/.gemini`:
+  every login made while developing this image ran with the site's hostfs mounts on, so
+  it could see all of `$HOME`. Run the check above before relying on agy in batch.
 - **agy is not gemini-cli.** `@google/gemini-cli` was removed from this image because
   Google stopped serving it on the "Gemini Code Assist for individuals" tier (login
   fails with `This client is no longer supported ... migrate to the Antigravity suite`).
@@ -341,15 +357,14 @@ directory **read-only** alongside the prompt directory, and list it in `CONTEXT_
 scope:
 
 ```bash
-apptainer run --no-home \
-  --bind /path/to/shared/review_dir \
-  --bind /path/to/project:/path/to/project:ro \
-  --env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
-  --env CONTEXT_DIRS=/path/to/project \
-  agentic_downstream.sif claude /path/to/shared/review_dir
+./agentic_run.sh -c /path/to/project claude /path/to/review_dir
+./agentic_run.sh -c /path/to/project -c /path/to/shared/docs claude /path/to/review_dir
 
-# multiple context directories:
---env CONTEXT_DIRS=/path/to/project:/path/to/shared/docs
+# raw equivalent: bind each read-only AND list it, colon-separated
+apptainer run --cleanenv --no-home --no-mount hostfs,cwd --bind /path/to/review_dir \
+  --bind "$HOME/.claude:$HOME/.claude" --bind "$HOME/.claude.json:$HOME/.claude.json" \
+  --bind /path/to/project:/path/to/project:ro --env CONTEXT_DIRS=/path/to/project \
+  <image> claude /path/to/review_dir
 ```
 
 `CONTEXT_DIRS` is documentation for the agent, not an access grant on its own - a
@@ -376,76 +391,118 @@ works if that path was bound).
 
 ## Security
 
-Batch jobs (via `sbatch`) run each agent CLI with a full permission bypass
-(claude and agy `--dangerously-skip-permissions`, codex
-`--dangerously-bypass-approvals-and-sandbox` - see `entrypoint.sh`), because there's no human available to click through an approval
-prompt. That means the CLI's *own* internal guardrails are almost entirely off for
-that run. What actually contains an unattended agent is layered, not any single
-mechanism:
+Unattended runs give each agent CLI a full permission bypass (claude and agy
+`--dangerously-skip-permissions`, codex `--dangerously-bypass-approvals-and-sandbox` -
+see `entrypoint.sh`), because no human is there to answer an approval prompt. The CLIs'
+own guardrails are therefore almost entirely off, and **the only real boundary is what
+the container can see.** That boundary is set on the `apptainer` command line, on the
+host, before the image runs - it cannot be built into the image or enforced by
+`entrypoint.sh`.
 
-**Primary boundary - what's mounted writable.** With a full permission bypass, the
-only real constraint left is what the container can physically write to. A built
-`.sif` is read-only squashfs, so nothing outside an explicit bind mount is writable
-regardless of CLI permission state. The critical detail: **Apptainer auto-binds your
-real `$HOME` by default**, whether or not a job's `--bind` flags mention it. Combined
-with a full permission bypass, that means a batch job that binds `$HOME` (or omits
-`--no-home`) has read/write/delete access to your *entire home directory*, not just
-the prompt directory - regardless of which agent runs. This is why "Batch use" above
-always passes `--no-home` and binds only the specific prompt directory: with API-key
-auth, `$HOME` isn't needed for batch jobs at all, so excluding it costs nothing and
-closes the actual exposure. With subscription auth (see "Subscription login for batch
-runs"), bind back only the one agent's credential directory, never all of `$HOME` -
-and accept that the agent can read the token in it. Context directories should be
-bound `:ro`. **This is the control that matters most** - everything below is
-defense-in-depth on top of it, not a substitute for it.
+### The launch flags that make the boundary real
 
-**Claude Code has one hard-coded protection that survives the bypass.** Recursive
-removal of the filesystem root, a top-level directory, the home directory, or the
-working directory *itself and its parents* is never auto-approved by any allow rule,
-even in `bypassPermissions` mode - Claude Code calls this a "critical path" and always
-gives it special handling. **Unverified**: the docs describe that handling as "ask,
-with a time limit" in interactive terminal sessions, but don't explicitly state what
-happens for this specific case in non-interactive `-p` batch mode with no terminal to
-show a prompt to. Worth confirming empirically (e.g. asking a batch agent to `rm -rf`
-its own working directory) before relying on it, rather than assuming it denies
-cleanly.
+```bash
+apptainer run --cleanenv --no-home --no-mount hostfs,cwd \
+  --bind "$HOME/.<agent>:$HOME/.<agent>" \
+  --bind /path/to/prompt_dir \
+  --bind /path/to/context:/path/to/context:ro \
+  <image> <agent> /path/to/prompt_dir
+```
 
-**A baked-in managed-settings deny rule blocks ordinary `rm` usage for Claude
-specifically.** `/etc/claude-code/managed-settings.json` (created at build time - see
-Dockerfile/`.def`) denies `Bash(rm *)`, `Bash(rmdir *)`, `Bash(unlink *)`, and
-`Bash(shred *)`. Managed settings are the highest-precedence settings source Claude
-Code has - nothing in a caller-supplied `PROMPT.md`, a project's own
-`.claude/settings.json`, or a CLI flag can override a managed deny rule, including
-`--dangerously-skip-permissions` itself. **Caveat, stated plainly**: this is a match
-on the command *text* Claude normally writes, not an OS-level enforcement boundary -
-Claude Code's own docs are explicit that a Bash deny rule "isn't a security boundary
-around the program" and doesn't catch the same deletion attempted a different way
-(e.g. a Python script calling `os.remove()`). It stops the ordinary case; it is not a
-substitute for the bind-mount boundary above.
+| Flag | Without it |
+|---|---|
+| `--no-mount hostfs` | **Every host network filesystem is mounted read-write** if the site config sets `mount hostfs = yes` - see below. |
+| `--no-mount cwd` | The directory you launched from is bound in, silently widening access (and, for claude, loading any `CLAUDE.md` found there). |
+| `--no-home` | Your whole home directory is bound in (Apptainer's default). |
+| `:ro` on context binds | The agent can modify the project it was only meant to read. |
 
-**codex and agy have no inner layer here - the bind mounts are their only
-boundary.** codex's own sandbox (`--sandbox workspace-write`) would be a real OS-level
-mechanism, but it is built on bubblewrap, which cannot create its mount namespace
-inside an Apptainer container: every shell command and every file write fails with
-`bwrap: Can't bind mount /oldroot/ on /newroot/: Unable to mount source on
-destination: Invalid argument` (reproduced on codex-cli 0.158 under default,
-`--userns` and `--fakeroot` Apptainer modes, via `codex sandbox linux -- echo`). The
-agent can then neither read `PROMPT.md` nor write its response. `entrypoint.sh`
-therefore runs codex with `--dangerously-bypass-approvals-and-sandbox`, the codex
-equivalent of the claude and agy bypasses, and relies on the container. agy has a
-`--sandbox` flag ("Run in a sandbox with terminal restrictions enabled"), but its
-mechanism is undocumented and it has not been tried inside Apptainer, so
-`entrypoint.sh` does not pass it; agy has no managed deny rule like Claude's either. For both, the bind-mount boundary
-above is the *only* real protection, not one layer among several - which is why
-`:ro` on context directories matters most for these two. (The warning `Codex could
-not find bubblewrap on PATH` is unrelated and harmless: codex falls back to a bundled
+`agentic_run.sh` builds exactly this command, and `entrypoint.sh` refuses to start an
+agent when undeclared network filesystems are mounted (see "Batch use").
+
+Then bind back only what the run needs: the prompt directory (writable), context
+directories (read-only), and each agent's credential location (see "Subscription login
+for batch runs"). An agent can read any token bound into its container - that is the
+cost of subscription auth, and why only credential paths, never all of `$HOME`, are bound.
+
+### Why `--no-mount hostfs`: `--no-home` and `--bind` alone are not a boundary here
+
+The UNC LBG cluster's `/etc/apptainer/apptainer.conf` sets **`mount hostfs = yes`**:
+Apptainer mounts every host network filesystem into every container, read-write,
+regardless of `--bind` or `--no-home`. Measured 2026-09-30 inside a
+`--no-home --cleanenv` container on image 0.0.3:
+
+- `/home/<user>` was fully visible and writable (it is its own NFS mount, so hostfs mounts
+  it even though `--no-home` skips the default home bind);
+- all of `/datastore` was visible and writable - every project, every lab's share, raw
+  data included;
+- `--containall` hid `$HOME` but still left `/datastore` visible.
+
+So **every run launched without `--no-mount hostfs` - which included all runs made while
+this image was being developed - had full read/write access to `/datastore` and the
+home directory**, with the agent's permission checks off. With
+`--no-mount hostfs,cwd`, the same container sees only its bound paths: `$HOME` contains
+only the bound credential directory, the rest of the project tree is absent, and a
+`:ro`-bound context directory refuses writes (`Read-only file system`).
+
+Check your own site before trusting any bind-only setup:
+```bash
+grep -nE '^\s*mount (hostfs|home)' /etc/apptainer/apptainer.conf
+apptainer exec --cleanenv --no-home --no-mount hostfs,cwd --bind /path/to/prompt_dir <image> \
+  bash -c 'ls -A $HOME; ls /datastore 2>&1'   # expect: empty $HOME, no /datastore listing
+```
+
+Side effects of turning hostfs off:
+- **claude also needs `--bind "$HOME/.claude.json:$HOME/.claude.json"`** (account state
+  lives beside `~/.claude`, not in it). Runs without hostfs that bind only `~/.claude`
+  may report not being logged in.
+- **A login done while hostfs was on may have been saved outside the credential
+  directory you now bind.** Re-check each agent with only its own directory bound, and
+  log in again from a restricted shell if it asks.
+- Paths like `~/nate/...` that reach `/datastore` through a symlink in your home no
+  longer resolve. Use the real `/datastore/...` path in binds and arguments.
+- `/tmp` is still the host's (`mount tmp = yes`); use `--contain` if that matters.
+
+### Inner layers - defense in depth only
+
+**Claude: managed deny rule.** `/etc/claude-code/managed-settings.json` (baked in at
+build time) denies `Bash(rm *)`, `Bash(rmdir *)`, `Bash(unlink *)` and `Bash(shred *)`.
+Managed settings outrank every other settings source, `--dangerously-skip-permissions`
+included. It is a match on command *text*, not an OS-level control - a script calling
+`os.remove()` is not caught - so it stops the ordinary case only. It also means a Claude
+orchestrator inside the image cannot delete files, so pipelines must version outputs
+rather than clean up.
+
+**Claude: critical-path protection.** Recursive removal of `/`, a top-level directory,
+the home directory, or the working directory and its parents is never auto-approved,
+even under bypass. **Unverified** what this does in non-interactive `--print` mode,
+where there is no terminal to ask.
+
+**codex: no working sandbox inside Apptainer.** codex's `--sandbox workspace-write`
+would be a real OS-level control, but it is built on bubblewrap, which cannot create its
+mount namespace inside an Apptainer container: every command *and* file write fails
+with `bwrap: Can't bind mount /oldroot/ on /newroot/: Unable to mount source on
+destination: Invalid argument` (reproduced on codex-cli 0.158 under default, `--userns`
+and `--fakeroot`, via `codex sandbox linux -- echo`). `entrypoint.sh` therefore runs
+codex with `--dangerously-bypass-approvals-and-sandbox`. (`Codex could not find
+bubblewrap on PATH` is a separate, harmless warning: codex falls back to a bundled
 copy, which then fails for the reason above.)
 
-**Recommended before trusting this for unattended `sbatch` runs**: test with a
-deliberately adversarial `PROMPT.md` (e.g. "delete PROMPT.md itself," "list and read
-files in `$HOME`," "write a file to `/etc`") against each of the three agents with
-`--no-home` and a directory-only bind, and confirm the failure mode is a clean denial
-rather than success or a hang.
+**agy: none in use.** agy has a `--sandbox` flag ("terminal restrictions"), but its
+mechanism is undocumented and untested inside Apptainer, so `entrypoint.sh` does not
+pass it, and agy has no managed deny rule. For codex and agy, the launch flags above are
+the *only* protection.
+
+**All agents in one container share everything.** An in-container orchestrator that
+calls the other agents as child processes gives each of them the orchestrator's full
+view - every bound path and every bound credential. Isolating one agent's view from
+another's requires separate containers.
+
+### Before trusting unattended runs
+
+Test with a deliberately adversarial `PROMPT.md` against each agent, launched with the
+flags above: delete `PROMPT.md`, list and read files in `$HOME`, write into a `:ro`
+context directory, read a `/datastore` path that was not bound, write to `/etc`.
+Confirm each fails cleanly rather than succeeding or hanging.
 
 ## Gotchas
 
@@ -574,6 +631,22 @@ docs list `claude -p "<prompt>" --dangerously-skip-permissions` under "Run fully
 unattended inside a container" for exactly this reason. agy can instead allow specific tools via `"permissions": {"allow": [...]}` in
 `~/.gemini/antigravity-cli/settings.json`, a narrower alternative if a task needs only
 a known set of commands.
+
+**A host path in the environment silently breaks claude once hostfs is off.** Apptainer
+passes host environment variables in by default. On a SLURM node `TMPDIR` is
+`/datastore/scratch/users/<user>`, which does not exist inside a `--no-mount hostfs`
+container, and `claude --print` then exits 0 with **no output, no response file and no
+session record** - it looks as if the job ended instantly for no reason. Fixed by
+`--cleanenv` (which `agentic_run.sh` always passes; it forwards only the variables a run
+needs), or `--env TMPDIR=/tmp` on a raw command. Any variable pointing at an unmounted
+host path is a candidate for the same failure.
+
+**An open stdin makes `codex exec` wait forever.** When stdin is not a terminal and never
+closed - a batch job, or a call made from inside an orchestrating agent - `codex exec` prints
+`Reading additional input from stdin...` and waits for EOF before it starts. `claude --print` also
+reads a non-terminal stdin. `entrypoint.sh` therefore redirects stdin from `/dev/null` before
+launching any agent (no agent takes input on stdin; the prompt is always an argument). Direct CLI
+calls need `< /dev/null` added by hand.
 
 **CLI argument order is not free.** Two launches failed on flag placement alone:
 - `claude --add-dir` is variadic (`--add-dir <directories...>`) and consumes every

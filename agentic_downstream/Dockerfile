@@ -32,9 +32,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # (~/.claude, ~/.codex, ~/.npm) land in the actual host home directory whether
 # credentials come from an interactive OAuth login or from API-key env vars at
 # batch-job time.
+# codex's native binary is an OPTIONAL dependency that npm silently skips on a failed
+# fetch; installing it by name, pinned to the installed codex version, makes that a
+# hard error here. See agentic_downstream.def.
 RUN npm install -g \
         @anthropic-ai/claude-code \
         @openai/codex && \
+    CODEX_VERSION="$(node -p "require('$(npm root -g)/@openai/codex/package.json').version")" && \
+    npm install -g "@openai/codex-linux-x64@npm:@openai/codex@${CODEX_VERSION}-linux-x64" && \
     npm cache clean --force
 
 # agy updates itself in place by default; the binary is baked into the image, so
