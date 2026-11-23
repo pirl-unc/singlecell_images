@@ -1,0 +1,16 @@
+# Paths under ~/.claude hidden from a claude agent by agentic_run.sh (one per line, relative to the credential
+# folder). A trailing "/" marks a folder; " rw" after a path gives it an empty WRITABLE folder instead of an empty
+# read-only one (the CLI must write there to start). Boundary-tested 2026-11-21 (README, "What a credential bind
+# also exposes"); a read-only session-env/ broke claude's Bash tool.
+projects/
+sessions/
+skills/
+plans/
+file-history/
+shell-snapshots/
+paste-cache/
+backups/
+jobs/
+state/
+history.jsonl
+session-env/ rw

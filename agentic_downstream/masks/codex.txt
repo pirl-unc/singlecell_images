@@ -1,0 +1,11 @@
+# Paths under ~/.codex hidden from a codex agent by agentic_run.sh (format: masks/claude.txt). Boundary-tested
+# 2026-11-21 (README, "What a credential bind also exposes").
+sessions/
+skills/
+shell_snapshots/
+log/
+history.jsonl
+session_index.jsonl
+memories_1.sqlite
+thread_history_1.sqlite
+logs_2.sqlite

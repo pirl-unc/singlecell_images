@@ -45,6 +45,9 @@ itself isn't here to fall back on.
 - `agentic_run.sh` - **host-side** launcher: builds the `apptainer run` command with the
   flags that make the container boundary real (see "Batch use" and "Security"). Not
   part of the image; changing it needs no rebuild.
+- `masks/` - one list per agent CLI of the paths inside its credential folder that
+  `agentic_run.sh` hides (see "What a credential bind also exposes"). Host-side, like the
+  launcher.
 - `build.sh` - builds either layer with its provenance recorded (see "Build", "Provenance")
 - `entrypoint.sh` - the batch-job launcher; copied into the final image (`%files` in the
   `.def`, `COPY` in the Dockerfile) and invoked by its `%runscript`/`ENTRYPOINT`
@@ -488,6 +491,52 @@ Side effects of turning hostfs off:
   longer resolve. Use the real `/datastore/...` path in binds and arguments.
 - `/tmp` is still the host's (`mount tmp = yes`); use `--contain` if that matters.
 
+### What a credential bind also exposes (masking)
+
+Binding a credential location binds the whole folder, and both CLIs keep far more than
+tokens there. `~/.claude` holds every Claude Code session's transcript (`projects/`),
+`sessions/`, `history.jsonl`, `plans/`, `file-history/`, `shell-snapshots/`,
+`paste-cache/`, `backups/`, `jobs/`, `session-env/`, `state/` and the user's `skills/`;
+`~/.codex` holds `sessions/` (past codex transcripts), `history.jsonl`,
+`session_index.jsonl`, `memories_1.sqlite`, `thread_history_1.sqlite`, `skills/` and
+logs. An unattended agent can read all of it, and an agent meant to work from its prompt
+alone is then shaped by other sessions' context (and, for skills, by user instructions).
+
+**`agentic_run.sh` masks by default** (since 2026-11-23; `-M` turns it off): for every agent
+whose credentials it binds, it covers each path listed in `masks/<agent>.txt` with an empty
+read-only folder or file, or an empty writable folder where the list says `rw`, made fresh
+per run under `$AGENTIC_MASK_ROOT` (default `/tmp/agentic_masks_$USER`), and declares those
+paths to the entrypoint's mount check (`EXTRA_ALLOWED_MOUNTS`). Paths missing on the host are
+skipped. To change what is hidden, edit the list; `-n` shows the binds. The lists (the ones
+boundary-tested 2026-11-21):
+
+| CLI | masked with an empty read-only bind | other |
+|---|---|---|
+| claude | `projects/`, `sessions/`, `skills/`, `plans/`, `file-history/`, `shell-snapshots/`, `paste-cache/`, `backups/`, `jobs/`, `state/`, `history.jsonl` | `session-env/` bound to a **writable** empty folder: read-only, it breaks claude's Bash tool |
+| codex | `sessions/`, `skills/`, `shell_snapshots/`, `log/`, `history.jsonl`, `session_index.jsonl`, `memories_1.sqlite`, `thread_history_1.sqlite`, `logs_2.sqlite` | |
+
+`masks/agy.txt` is empty: `~/.gemini` has not been inventoried yet.
+
+Boundary test of the launcher's own masking, 2026-11-23 (claude and codex, no hand-made
+binds, the 2026-11-21 prompt; results in `/datastore/scratch/users/nwheeler/agent_boundary_20261123/`):
+every listed path appeared empty (claude's `session-env/` held only the run's own marker),
+`$HOME` held only the running agent's credential paths, `/etc` was read-only, the canary,
+workhub and `/datastore` paths were absent, writes worked only in the prompt folder and
+`/tmp`, and web fetch worked. Still readable to codex and not yet judged: `goals_1.sqlite`,
+`state_5.sqlite`, `queue_1.sqlite`, `cache/`, `plugins/`, `packages/` (whether any holds
+past-session text, and whether codex starts without them, is untested).
+
+Before the launcher did this, masks were passed by hand as `-b` binds; an example, as used
+by one project: `~/workhub/concept-sheets/_reviews/2026-11-21_external/_build/claude_mask_binds.txt`
+and `codex_mask_binds.txt` beside it; their paths are that user's (scratch folder and home),
+so they show the form, not files to reuse. Tested 2026-11-21 with the boundary test ("Before trusting
+unattended runs"), both CLIs: every masked path appeared empty, reads, writes and deletes
+outside the prompt folder failed, login and web tools worked. Earlier runs had partial
+masks: the literature searches of 2026-11-19 and 2026-11-20 masked claude's `projects/`,
+`sessions/`, `skills/`, `plans/`, `file-history/`, `shell-snapshots/` and `history.jsonl`
+only, and codex not at all, so those codex agents could read past codex sessions, history
+and memories.
+
 ### Inner layers - defense in depth only
 
 **Claude: managed deny rule.** `/etc/claude-code/managed-settings.json` (baked in at
@@ -531,6 +580,20 @@ context directory, read a `/datastore` path that was not bound, write to `/etc`.
 Confirm each fails cleanly rather than succeeding or hanging.
 
 ## Gotchas
+
+**Research agents (literature and data searches, 2026-11-19 and 2026-11-20).** Pattern:
+one SLURM job per topic × agent (`sbatch --wrap "agentic_run.sh -i <image> -e
+RESPONSE_FILE=RESPONSE.md -e AGENT_EFFORT=high <agent> <topic>/<agent>"`, 2 CPUs, 4 GB,
+3.5 h), prompts generated from one template plus a topic table, each agent writing
+`RESPONSE.md`, `sources.tsv` and `RESPONSE.md.done` in its own folder; worked example in
+`tumor-screen-newref-v1/review/lit_search/2026-11-19_stage1/_build/`. Found in use:
+- **codex stops early** under a ceiling-only prompt ("screen at most 20 sources"): its
+  first pass screened 3-8 sources where claude screened 12-20. A floor fixed it ("screen
+  at least 12 primary sources by abstract before stopping, unless fewer exist").
+- **GEO accession pages return a CAPTCHA** to the agents' fetchers; they fell back on the
+  GEO FTP listing (`ftp.ncbi.nlm.nih.gov/geo/series/...`), sample pages or the OmicsDI
+  mirror. Tell agents so in the prompt, or check access afterwards.
+- Runs took 4-12 minutes per agent (claude longer and deeper than codex).
 
 Recorded because each one cost a build cycle on `../singlecell_downstream`, and this
 image installs much of the same package chain, so the same failure modes apply here.

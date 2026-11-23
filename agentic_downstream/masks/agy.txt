@@ -1,0 +1,2 @@
+# Paths under ~/.gemini hidden from an agy agent by agentic_run.sh (format: masks/claude.txt). Not yet inventoried:
+# list ~/.gemini after an agy run, add what holds past sessions or history, and boundary-test before relying on it.

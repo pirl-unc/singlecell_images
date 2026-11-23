@@ -23,6 +23,7 @@
 #   -k          pass ANTHROPIC/OPENAI/CODEX/GEMINI API key variables in (via APPTAINERENV_,
 #               so never on the command line). Default: not passed, so runs use the stored
 #               subscription logins rather than API billing.
+#   -M          do NOT mask the credential folders' history (default: masked, see below)
 #   -n          dry run: print the apptainer command and exit
 #
 # Always applied: --cleanenv (the host environment is NOT passed in - only the
@@ -30,6 +31,15 @@
 # writable, credentials bound individually (never all of $HOME), and all paths
 # resolved to their real location (a ~/nate/... symlink path does not exist inside
 # the container once hostfs is off).
+#
+# Credential masking (default; -M turns it off): a credential bind exposes the whole
+# folder, and both CLIs keep past sessions, history, memories, skills and caches there.
+# For every agent whose credentials are bound, each path listed in masks/<agent>.txt
+# (beside this script) is covered by an empty read-only folder or file, or by an empty
+# writable folder where the list says "rw"; paths that do not exist on the host are
+# skipped. The empty sources are made fresh per run under $AGENTIC_MASK_ROOT (default
+# /tmp/agentic_masks_$USER) and declared to the entrypoint's mount check. Lists and the
+# 2026-11-21 boundary test: README.md, "What a credential bind also exposes".
 #
 # Forwarded from the calling shell when set (so `AGENT_MODEL=x agentic_run.sh ...` works
 # as well as -e): AGENT_MODEL AGENT_EFFORT AGENT_VERBOSE PROMPT_FILE RESPONSE_FILE
@@ -51,8 +61,9 @@ ENV_ARGS=()
 OVERRIDE=""
 KEEP_KEYS=0
 DRY_RUN=0
+MASK=1
 
-while getopts ":i:c:b:ae:o:knh" opt; do
+while getopts ":i:c:b:ae:o:kMnh" opt; do
   case "$opt" in
     i) IMAGE="$OPTARG" ;;
     c) CONTEXT_DIRS_ARG+=("$OPTARG") ;;
@@ -61,6 +72,7 @@ while getopts ":i:c:b:ae:o:knh" opt; do
     e) ENV_ARGS+=("$OPTARG") ;;
     o) OVERRIDE="$OPTARG" ;;
     k) KEEP_KEYS=1 ;;
+    M) MASK=0 ;;
     n) DRY_RUN=1 ;;
     h) usage ;;
     :) echo "Option -$OPTARG needs a value" >&2; usage ;;
@@ -106,6 +118,39 @@ for a in "${cred_agents[@]}"; do
   done
 done
 
+# Mask each listed history/cache path inside the bound credential folders (see header).
+mask_allowed=""
+if (( MASK )); then
+  mask_dir="$(dirname "$(realpath "$0")")/masks"
+  mask_root="${AGENTIC_MASK_ROOT:-/tmp/agentic_masks_$USER}"
+  run_masks=""
+  for a in "${cred_agents[@]}"; do
+    list="$mask_dir/$a.txt"
+    [[ -f "$list" ]] || { echo "Warning: no mask list $list - '$a' credential folder bound unmasked." >&2; continue; }
+    base="$(cred_paths "$a" | awk '{print $1}')"
+    [[ -e "$base" ]] || continue
+    while read -r rel mode; do
+      [[ -z "$rel" || "$rel" == \#* ]] && continue
+      target="$base/${rel%/}"
+      [[ -e "$target" ]] || continue
+      if [[ -z "$run_masks" ]]; then
+        if (( DRY_RUN )); then run_masks="$mask_root/<run>"
+        else mkdir -p "$mask_root"; run_masks="$(mktemp -d "$mask_root/run_XXXXXX")"; touch "$run_masks/empty_file"; mkdir -p "$run_masks/empty_dir"; fi
+      fi
+      if [[ "$mode" == "rw" ]]; then
+        src="$run_masks/rw_${a}_$(echo "${rel%/}" | tr '/' '_')"
+        (( DRY_RUN )) || mkdir -p "$src"
+        args+=(--bind "$src:$target")
+      elif [[ -d "$target" ]]; then
+        args+=(--bind "$run_masks/empty_dir:$target:ro")
+      else
+        args+=(--bind "$run_masks/empty_file:$target:ro")
+      fi
+      mask_allowed="${mask_allowed:+$mask_allowed:}$target"
+    done < "$list"
+  done
+fi
+
 context_list=""
 for d in "${CONTEXT_DIRS_ARG[@]}"; do
   rd="$(realpath "$d" 2>/dev/null)" || { echo "Context directory not found: $d" >&2; exit 1; }
@@ -123,6 +168,7 @@ for b in "${EXTRA_BINDS[@]}"; do
   args+=(--bind "$rsrc:$dst${mode:+:$mode}")
   extra_allowed="${extra_allowed:+$extra_allowed:}$dst"
 done
+[[ -n "$mask_allowed" ]] && extra_allowed="${extra_allowed:+$extra_allowed:}$mask_allowed"
 [[ -n "$extra_allowed" ]] && args+=(--env "EXTRA_ALLOWED_MOUNTS=$extra_allowed")
 
 if [[ -n "$OVERRIDE" ]]; then
